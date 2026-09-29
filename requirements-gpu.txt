@@ -1,0 +1,13 @@
+# Опциональные зависимости для распознавания речи на видеокарте (NVIDIA/CUDA).
+#
+# Ставятся автоматически из run.sh / run.bat, если найден nvidia-smi,
+# либо вручную:  .venv/Scripts/python -m pip install -r requirements-gpu.txt
+#
+# Без них ассистент работает на Vosk (CPU) — см. config.json -> asr_engine.
+# Первый запуск скачает модель whisper (~1.6 ГБ для large-v3-turbo) в кэш
+# HuggingFace: %USERPROFILE%\.cache\huggingface
+
+faster-whisper>=1.2
+# cuBLAS и cuDNN под CUDA 12: CTranslate2 ищет cublas64_12.dll / cudnn64_9.dll
+nvidia-cublas-cu12>=12.4
+nvidia-cudnn-cu12>=9.1
