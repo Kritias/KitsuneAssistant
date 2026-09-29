@@ -28,7 +28,18 @@ for _stream in (sys.stdout, sys.stderr):
         except (AttributeError, ValueError):
             pass
 
-from assistant_core import FoxAssistantCore, MARKER_FILE, load_language_dict
+from assistant_core import (
+    FoxAssistantCore,
+    MARKER_FILE,
+    MODE_BASIC,
+    MODE_FULL,
+    apply_mode_defaults,
+    load_language_dict,
+)
+try:
+    import tts_local
+except Exception:  # модуль опционален: базовому режиму он не нужен
+    tts_local = None
 
 # --- Киберпанк-палитра KITSUNE ---
 HUD_THEME = {
@@ -159,7 +170,7 @@ class FoxAssistantApp(ctk.CTk):
         остальных API у устройств другие индексы и латентности, и выбрать
         их в config можно только случайно. Псевдоустройства (Sound Mapper,
         «первичный драйвер») и служебные записи с мусорными именами
-        (@System32\...) отбрасываются по чёрному списку.
+        («@System32\...») отбрасываются по чёрному списку.
         """
         devices = []
         seen_names = set()
@@ -209,6 +220,10 @@ class FoxAssistantApp(ctk.CTk):
             pass
         return devices
 
+    def _full_mode(self):
+        """Полный режим: whisper, Silero, kokoro и их настройки доступны."""
+        return bool(self.core.config.get("full_mode", False))
+
     def setup_actions_and_voices(self):
         act_map = self.lang.get("actions", {})
         self.actions_dict = {
@@ -253,13 +268,26 @@ class FoxAssistantApp(ctk.CTk):
         else:
             self.voice_options = {
                 self.t("voice_ru_auto"): ("auto", "", "+0Hz", "+0%"),
-                self.t("voice_ru_silero"): ("silero", "baya", "+0Hz", "+0%"),
-                self.t("voice_ru_kokoro"): ("kokoro", "sveta", "+0Hz", "+0%"),
                 self.t("voice_ru_kitsune"): ("edge-tts", "ru-RU-SvetlanaNeural", "+10Hz", "+15%"),
                 self.t("voice_ru_kawaii"): ("edge-tts", "ru-RU-SvetlanaNeural", "+75Hz", "+35%"),
                 self.t("voice_ru_svetlana"): ("edge-tts", "ru-RU-SvetlanaNeural", "-10Hz", "-5%"),
                 self.t("voice_sapi"): ("pyttsx3", "", "+0Hz", "+0%")
             }
+        if self._full_mode():
+            # Локальные движки видны только в полном режиме: в базовом они
+            # всё равно не озвучивают, а пункты без движка сбивают с толку.
+            # Пересобираем список: авто → локальные → edge-голоса → SAPI.
+            rebuilt = {self.t("voice_ru_auto"): ("auto", "", "+0Hz", "+0%")}
+            if self.cur_lang == "en":
+                rebuilt[self.t("voice_ru_silero")] = ("silero", "baya", "+0Hz", "+0%")
+                rebuilt[self.t("voice_ru_kokoro")] = ("kokoro", "sveta", "+0Hz", "+0%")
+            else:
+                rebuilt[self.t("voice_ru_silero")] = ("silero", "baya", "+0Hz", "+0%")
+                rebuilt[self.t("voice_ru_kokoro")] = ("kokoro", "sveta", "+0Hz", "+0%")
+            rebuilt.update({
+                k: v for k, v in self.voice_options.items() if v[0] != "auto"
+            })
+            self.voice_options = rebuilt
 
     def _resolve_asset_path(self, config_key, default_resource_file):
         cfg_val = self.core.config.get(config_key, "").strip()
@@ -461,6 +489,20 @@ class FoxAssistantApp(ctk.CTk):
             pass
         os._exit(0)
 
+    def _asr_engine_options(self):
+        """Доступные движки распознавания для списка настроек.
+
+        Базовому режиму whisper не показывается: он там всё равно не
+        поднимется, а «настройка, которая ничего не делает», только путает.
+        """
+        options = {
+            self.t("asr_engine_auto"): "auto",
+            self.t("asr_engine_vosk"): "vosk",
+        }
+        if self._full_mode():
+            options[self.t("asr_engine_whisper")] = "whisper"
+        return options
+
     def _set_engine_combo(self, engine_value):
         wanted = str(engine_value).lower()
         for label, value in self.asr_engine_values.items():
@@ -520,15 +562,91 @@ class FoxAssistantApp(ctk.CTk):
         )
         lbl_desc.pack(padx=20, pady=(0, 20))
 
+        # Кнопка режима: «включить фулл» в базовом, «вернуть базовый» в полном.
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 20))
+        btn_row.grid_columnconfigure(0, weight=1)
+        btn_row.grid_columnconfigure(1, weight=1)
+
+        if self._full_mode():
+            mode_btn_text = self.t("about_disable_full_btn")
+            mode_btn_colors = {
+                "fg_color": "#26334A",
+                "hover_color": "#36475F",
+                "text_color": HUD_THEME["text_bright"],
+            }
+        else:
+            mode_btn_text = self.t("about_enable_full_btn")
+            mode_btn_colors = {
+                "fg_color": "#00F0FF",
+                "hover_color": "#00B8C4",
+                "text_color": HUD_THEME["chassis_dark"],
+            }
+
+        btn_mode = ctk.CTkButton(
+            btn_row,
+            text=mode_btn_text,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=32, corner_radius=6,
+            command=lambda: self.toggle_full_mode(about_win),
+            **mode_btn_colors
+        )
+        btn_mode.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
         btn_close = ctk.CTkButton(
-            card, text=self.t("about_close_btn"),
+            btn_row,
+            text=self.t("about_close_btn"),
             fg_color="#FB8500", hover_color="#D94400",
             text_color=HUD_THEME["chassis_dark"],
             font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
             height=32, corner_radius=6,
             command=about_win.destroy
         )
-        btn_close.pack(pady=(0, 20))
+        btn_close.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+    def toggle_full_mode(self, window=None):
+        """Включает/выключает полный режим и применяет его дефолты.
+
+        Полный: auto-выбор движков — whisper на CUDA, Silero/kokoro по железу,
+        в настройках появляются выбор движка и голоса. Базовый: Vosk и
+        edge-tts, тяжёлые модели не выбираются и не качаются. Настройки
+        движков переписываются дефолтами режима, остальное сохраняется.
+        """
+        new_full = not self._full_mode()
+        apply_mode_defaults(self.core.config, new_full)
+        self.core.save_config()
+
+        # Пересобираем движки под новый режим: в базовом это остановит
+        # фоновые загрузки локальных моделей и выключит whisper.
+        self.core._init_asr_engine()
+        self.core._init_tts_engine()
+        self.core.rebuild_recognizer()
+        self.core.reset_wake_state()
+
+        self.setup_actions_and_voices()
+        self._refresh_mode_dependent_ui()
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+        label = self.t("mode_enabled_full_msg") if new_full else self.t("mode_disabled_full_msg")
+        self.update_chat("System", label)
+
+    def _refresh_mode_dependent_ui(self):
+        """Обновляет экран настроек под текущий режим без пересоздания окна.
+
+        Проще всего пересобрать экран заново: он статичен между режимами, а
+        точечное скрытие/показ каждого виджета легко рассинхронизировать.
+        """
+        if hasattr(self, "frame_settings"):
+            was_visible = self.frame_settings.winfo_ismapped()
+            self.frame_settings.destroy()
+            self.build_settings_screen()
+            if was_visible:
+                self.show_settings()
+            else:
+                self.frame_settings.pack_forget()
 
     def retranslate_ui(self):
         self.title(self.t("app_title"))
@@ -584,11 +702,7 @@ class FoxAssistantApp(ctk.CTk):
         self.lbl_settings_asr_engine.configure(text=self.t("settings_lbl_asr_engine"))
         
         current_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
-        self.asr_engine_values = {
-            self.t("asr_engine_auto"): "auto",
-            self.t("asr_engine_vosk"): "vosk",
-            self.t("asr_engine_whisper"): "whisper",
-        }
+        self.asr_engine_values = self._asr_engine_options()
         self.combo_asr_engine.configure(values=list(self.asr_engine_values.keys()))
         self._set_engine_combo(current_engine)
         self.btn_save_settings.configure(text=self.t("settings_btn_save"))
@@ -605,6 +719,19 @@ class FoxAssistantApp(ctk.CTk):
             self.combo_mic.set(cur_mic)
 
         self.combo_voice.set(self._voice_display_for_config())
+
+        # Скрытие/показ голосов локальных движков зависит от режима.
+        if self._full_mode():
+            self.lbl_settings_silero.pack(anchor="w", padx=22, pady=(5, 2))
+            self.combo_silero.pack(anchor="w", padx=22, pady=(0, 16))
+            self.lbl_settings_kokoro.pack(anchor="w", padx=22, pady=(5, 2))
+            self.combo_kokoro.pack(anchor="w", padx=22, pady=(0, 16))
+        else:
+            self.lbl_settings_silero.pack_forget()
+            self.combo_silero.pack_forget()
+            self.lbl_settings_kokoro.pack_forget()
+            self.combo_kokoro.pack_forget()
+
         self.refresh_editor_command_list()
 
     def _voice_display_for_config(self):
@@ -1529,6 +1656,39 @@ class FoxAssistantApp(ctk.CTk):
         )
         self.combo_voice.set(self._voice_display_for_config())
         self.combo_voice.pack(anchor="w", padx=22, pady=(0, 16))
+
+        # --- Выбор голоса Silero и kokoro (только полный режим) ---
+        self.silero_speakers = tts_local.silero_speakers() if tts_local else ["baya"]
+        self.kokoro_voices = tts_local.kokoro_voices() if tts_local else ["sveta"]
+
+        self.lbl_settings_silero = ctk.CTkLabel(box, text=self.t("settings_lbl_silero"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_kokoro = ctk.CTkLabel(box, text=self.t("settings_lbl_kokoro"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+
+        self.combo_silero = ctk.CTkComboBox(
+            box, values=self.silero_speakers, width=200,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            state="readonly"
+        )
+        cur_silero = self.core.config.get("silero_speaker", "") or "baya"
+        self.combo_silero.set(cur_silero if cur_silero in self.silero_speakers else self.silero_speakers[0])
+
+        self.combo_kokoro = ctk.CTkComboBox(
+            box, values=self.kokoro_voices, width=200,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            state="readonly"
+        )
+        cur_kokoro = self.core.config.get("kokoro_voice", "") or "sveta"
+        self.combo_kokoro.set(cur_kokoro if cur_kokoro in self.kokoro_voices else self.kokoro_voices[0])
+
+        if self._full_mode():
+            self.lbl_settings_silero.pack(anchor="w", padx=22, pady=(5, 2))
+            self.combo_silero.pack(anchor="w", padx=22, pady=(0, 16))
+            self.lbl_settings_kokoro.pack(anchor="w", padx=22, pady=(5, 2))
+            self.combo_kokoro.pack(anchor="w", padx=22, pady=(0, 16))
         
         self.lbl_settings_timeout = ctk.CTkLabel(box, text=self.t("settings_lbl_timeout"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
         self.lbl_settings_timeout.pack(anchor="w", padx=22, pady=(5, 2))
@@ -1566,11 +1726,7 @@ class FoxAssistantApp(ctk.CTk):
         self.lbl_settings_asr_engine = ctk.CTkLabel(box, text=self.t("settings_lbl_asr_engine"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
         self.lbl_settings_asr_engine.pack(anchor="w", padx=22, pady=(5, 2))
 
-        self.asr_engine_values = {
-            self.t("asr_engine_auto"): "auto",
-            self.t("asr_engine_vosk"): "vosk",
-            self.t("asr_engine_whisper"): "whisper",
-        }
+        self.asr_engine_values = self._asr_engine_options()
         self.combo_asr_engine = ctk.CTkComboBox(
             box, values=list(self.asr_engine_values.keys()), width=400,
             fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
@@ -1618,6 +1774,10 @@ class FoxAssistantApp(ctk.CTk):
         tts_engine_changed = False
         if choice in self.voice_options:
             engine_type, voice_name, pitch_mod, rate_mod = self.voice_options[choice]
+            # Базовый режим не даёт выбрать локальный движок, но конфиг мог
+            # остаться от полного: такие значения не сохраняем.
+            if engine_type in ("silero", "kokoro") and not self._full_mode():
+                return
             tts_engine_changed = engine_type != str(self.core.config.get("tts_engine", "auto")).lower()
             self.core.config["tts_engine"] = engine_type
             if engine_type == "edge-tts":
@@ -1633,6 +1793,18 @@ class FoxAssistantApp(ctk.CTk):
             elif engine_type == "kokoro":
                 self.core.config["kokoro_voice"] = voice_name
 
+        if self._full_mode():
+            # Конкретный голос выбранного движка: применяется в ядре при
+            # пересборке, даже если тип движка не менялся.
+            if hasattr(self, "combo_silero") and self.combo_silero.get() in self.silero_speakers:
+                if self.core.config.get("silero_speaker") != self.combo_silero.get():
+                    tts_engine_changed = True
+                self.core.config["silero_speaker"] = self.combo_silero.get()
+            if hasattr(self, "combo_kokoro") and self.combo_kokoro.get() in self.kokoro_voices:
+                if self.core.config.get("kokoro_voice") != self.combo_kokoro.get():
+                    tts_engine_changed = True
+                self.core.config["kokoro_voice"] = self.combo_kokoro.get()
+
         chosen_mic_label = self.combo_mic.get()
         default_mic_text = self.t("mic_default")
         if chosen_mic_label == default_mic_text or not chosen_mic_label:
@@ -1643,6 +1815,9 @@ class FoxAssistantApp(ctk.CTk):
         self.core.config["asr_grammar"] = bool(self.check_grammar.get())
         self.core.config["asr_debug"] = bool(self.check_asr_debug.get())
         selected_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
+        if not self._full_mode():
+            # Базовый режим: whisper недоступен независимо от выбора в списке.
+            selected_engine = "vosk"
         engine_changed = selected_engine != str(self.core.config.get("asr_engine", "auto")).lower()
         self.core.config["asr_engine"] = selected_engine
 

@@ -775,6 +775,20 @@ def create_engine(engine_name: str, config: dict, directory: str | None = None):
     return None
 
 
+def silero_speakers() -> list[str]:
+    """Голоса Silero.
+
+    Поднимать модель ради списка голосов слишком дорого (torch + загрузка
+    весов), а у v5_ru состав фиксирован — отдаём статический перечень.
+    """
+    return list(SILERO_FALLBACK_SPEAKERS)
+
+
+def kokoro_voices() -> list[str]:
+    """Голоса kokoro из карты голосов."""
+    return list(KOKORO_VOICES)
+
+
 def normalize_peak(audio, target: float = 0.9, max_gain: float = 8.0):
     """Выравнивает громкость движков по пику сигнала.
 
