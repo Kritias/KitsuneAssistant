@@ -814,6 +814,77 @@ def kokoro_voices() -> list[str]:
     return list(KOKORO_VOICES)
 
 
+def split_for_early_playback(text: str, first_limit: int = 140, next_limit: int = 240) -> list[str]:
+    """Делит реплику так, чтобы первую фразу можно было озвучить сразу.
+
+    Silero, kokoro и SAPI синтезируют текст целиком. Пока модель считает
+    длинный ответ, звука нет. Первое предложение (или его начало, если оно
+    очень длинное) уходит в синтез отдельно, остаток пакуется крупнее, чтобы
+    не дёргать модель на каждом коротком «уруру».
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return []
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?…])\s+", text) if part.strip()]
+    pieces: list[str] = []
+    for sentence in sentences:
+        limit = first_limit if not pieces else next_limit
+        pieces.extend(_break_long_phrase(sentence, limit))
+    if len(pieces) <= 1:
+        return pieces or [text]
+
+    packed = [pieces[0]]
+    buf = ""
+    for part in pieces[1:]:
+        if buf and len(buf) + 1 + len(part) > next_limit:
+            packed.append(buf)
+            buf = part
+        else:
+            buf = f"{buf} {part}".strip()
+    if buf:
+        packed.append(buf)
+    return packed
+
+
+def _break_long_phrase(text: str, limit: int) -> list[str]:
+    """Режет фразу длиннее limit по запятым, не разрывая слова."""
+    if len(text) <= limit:
+        return [text]
+    clauses = [part.strip() for part in re.split(r"(?<=[,;:])\s+", text) if part.strip()]
+    if len(clauses) == 1:
+        clauses = text.split()
+        glued = []
+        buf = ""
+        for word in clauses:
+            if buf and len(buf) + 1 + len(word) > limit:
+                glued.append(buf)
+                buf = word
+            else:
+                buf = f"{buf} {word}".strip()
+        if buf:
+            glued.append(buf)
+        return glued or [text]
+
+    packed = []
+    buf = ""
+    for clause in clauses:
+        if len(clause) > limit:
+            if buf:
+                packed.append(buf)
+                buf = ""
+            packed.extend(_break_long_phrase(clause, limit))
+            continue
+        if buf and len(buf) + 1 + len(clause) > limit:
+            packed.append(buf)
+            buf = clause
+        else:
+            buf = f"{buf} {clause}".strip()
+    if buf:
+        packed.append(buf)
+    return packed or [text]
+
+
 def normalize_peak(audio, target: float = 0.9, max_gain: float = 8.0):
     """Выравнивает громкость движков по пику сигнала.
 

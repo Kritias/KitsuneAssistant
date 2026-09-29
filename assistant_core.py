@@ -365,6 +365,105 @@ class _EdgeMp3Feeder(miniaudio.StreamableSource if miniaudio is not None else ob
             return chunk
 
 
+class _LivePcmPlayer:
+    """Играет float32-кадры по мере поступления, не дожидаясь всей реплики."""
+
+    def __init__(self, owner, sample_rate):
+        self.owner = owner
+        self.sr = int(sample_rate)
+        self.blocks = deque()
+        self.lock = threading.Lock()
+        self.offset = 0
+        self.done = False
+        self.samples = 0
+        self.finished = threading.Event()
+        self._stream = None
+
+    def push(self, samples):
+        arr = np.array(samples, dtype=np.float32, copy=True).reshape(-1)
+        if arr.size == 0 or self.done:
+            return
+        with self.lock:
+            self.blocks.append(arr)
+            self.samples += int(arr.size)
+            start = self._stream is None
+        if start:
+            self._open()
+
+    def _open(self):
+        def callback(outdata, frames, time_info, status):
+            if self.owner.stop_speech_event.is_set():
+                outdata.fill(0)
+                self.finished.set()
+                raise sd.CallbackStop
+            filled, exhausted = self._pull(frames, outdata[:, 0])
+            if filled < frames:
+                outdata[filled:, 0] = 0.0
+            if filled > 0:
+                self.owner._calc_spectrum(outdata[:filled, 0], sr=self.sr)
+            if exhausted:
+                self.finished.set()
+                raise sd.CallbackStop
+
+        stream = sd.OutputStream(
+            samplerate=self.sr, channels=1, blocksize=1600, callback=callback
+        )
+        self._stream = stream
+        self.owner.active_output_stream = stream
+        try:
+            stream.start()
+        except Exception:
+            self._stream = None
+            self.owner.active_output_stream = None
+            self.finished.set()
+            raise
+
+    def _pull(self, frames, out):
+        filled = 0
+        with self.lock:
+            while filled < frames and self.blocks:
+                block = self.blocks[0]
+                avail = len(block) - self.offset
+                take = min(avail, frames - filled)
+                out[filled:filled + take] = block[self.offset:self.offset + take]
+                self.offset += take
+                filled += take
+                if self.offset >= len(block):
+                    self.blocks.popleft()
+                    self.offset = 0
+            exhausted = self.done and not self.blocks
+        return filled, exhausted
+
+    def finish(self):
+        """Доигрывает уже принятые кадры и отпускает устройство."""
+        with self.lock:
+            self.done = True
+        if self._stream is None:
+            self.finished.set()
+            return
+        while not self.finished.is_set():
+            if self.owner.stop_speech_event.is_set() or not self._stream.active:
+                try:
+                    self._stream.abort()
+                except Exception:
+                    pass
+                break
+            self.finished.wait(timeout=0.03)
+        stream = self._stream
+        self._stream = None
+        if self.owner.active_output_stream is stream:
+            self.owner.active_output_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
 def load_language_dict(lang_code="ru"):  
     file_path = os.path.join(BASE_DIR, "lang", f"{lang_code}.lang")
     if not os.path.exists(file_path):  
@@ -1133,35 +1232,7 @@ class FoxAssistantCore:
 
     def _play_mp3_feeder(self, feeder, sr=24000):
         """Декодирует mp3 из feeder и играет с первого готового кадра."""
-        pcm_blocks = deque()
-        lock = threading.Lock()
-        state = {"offset": 0, "done": False, "samples": 0}
-        finished = threading.Event()
-
-        def push(samples):
-            arr = np.array(samples, dtype=np.float32, copy=True).reshape(-1)
-            if arr.size == 0:
-                return
-            with lock:
-                pcm_blocks.append(arr)
-                state["samples"] += int(arr.size)
-
-        def pull(frames, out):
-            filled = 0
-            with lock:
-                while filled < frames and pcm_blocks:
-                    block = pcm_blocks[0]
-                    avail = len(block) - state["offset"]
-                    take = min(avail, frames - filled)
-                    out[filled:filled + take] = block[state["offset"]:state["offset"] + take]
-                    state["offset"] += take
-                    filled += take
-                    if state["offset"] >= len(block):
-                        pcm_blocks.popleft()
-                        state["offset"] = 0
-                exhausted = state["done"] and not pcm_blocks
-            return filled, exhausted
-
+        player = _LivePcmPlayer(self, sr)
         gen = miniaudio.stream_any(
             feeder,
             source_format=miniaudio.FileFormat.MP3,
@@ -1172,47 +1243,18 @@ class FoxAssistantCore:
         )
         try:
             try:
-                while state["samples"] == 0:
-                    push(next(gen))
+                while player.samples == 0:
+                    player.push(next(gen))
             except StopIteration:
                 return False
-
-            def stream_callback(outdata, frames, time_info, status):
+            for samples in gen:
                 if self.stop_speech_event.is_set():
-                    outdata.fill(0)
-                    finished.set()
-                    raise sd.CallbackStop
-                filled, exhausted = pull(frames, outdata[:, 0])
-                if filled < frames:
-                    outdata[filled:, 0] = 0.0
-                if filled > 0:
-                    self._calc_spectrum(outdata[:filled, 0], sr=sr)
-                if exhausted:
-                    finished.set()
-                    raise sd.CallbackStop
-
-            with sd.OutputStream(samplerate=sr, channels=1, blocksize=1600, callback=stream_callback) as stream:
-                self.active_output_stream = stream
-                try:
-                    for samples in gen:
-                        if self.stop_speech_event.is_set():
-                            break
-                        push(samples)
-                finally:
-                    with lock:
-                        state["done"] = True
-                while not finished.is_set():
-                    if self.stop_speech_event.is_set():
-                        try:
-                            stream.abort()
-                        except Exception:
-                            pass
-                        break
-                    finished.wait(timeout=0.03)
-                self.active_output_stream = None
+                    break
+                player.push(samples)
         finally:
+            player.finish()
             gen.close()
-        return state["samples"] > 0 and not self.stop_speech_event.is_set()
+        return player.samples > 0 and not self.stop_speech_event.is_set()
          
     def _play_audio_array(self, audio_float, sr):  
         cursor = 0  
@@ -1350,14 +1392,17 @@ class FoxAssistantCore:
         engine = self._tts_engine_cache.get(engine_name)
         if engine is None:
             return False
-        audio, sr = engine.synthesize(text)
-        if self.stop_speech_event.is_set() or audio is None or len(audio) == 0:
-            return False
-        # Громкость выравнивается по пику: движки отдают её очень по-разному,
-        # и без этого смена голоса слышалась бы как скачок громкости.
-        audio = tts_local.normalize_peak(audio)
-        self._play_audio_array(np.asarray(audio, dtype="float32"), int(sr))
-        return True
+
+        def synthesize(piece):
+            audio, sr = engine.synthesize(piece)
+            if self.stop_speech_event.is_set() or audio is None or len(audio) == 0:
+                return None
+            return audio, int(sr)
+
+        # Первая фраза начинает звучать, пока модель считает продолжение.
+        return self._speak_synthesized_chunks(
+            tts_local.split_for_early_playback(text), synthesize
+        )
 
     def _sync_local_voice(self):
         """Роняет кэш движков, если в настройках сменился голос.
@@ -1427,55 +1472,117 @@ class FoxAssistantCore:
                 return True
         return False
 
-    def _speak_sapi(self, text):
-        """Последний фолбэк: системный голос Windows через SAPI5."""
-        temp_wav = os.path.join(tempfile.gettempdir(), f"fox_{os.getpid()}_{int(time.time()*1000)}.wav")
+    def _speak_synthesized_chunks(self, chunks, synthesize):
+        """Синтезирует куски по очереди и играет с первого готового.
 
-        def _render_sapi():
+        ``synthesize(text)`` возвращает ``(float32 mono, sample_rate)`` или
+        None. Следующий кусок считается, пока предыдущий уже звучит.
+        """
+        player = None
+        try:
+            for chunk in chunks:
+                if self.stop_speech_event.is_set():
+                    break
+                try:
+                    produced = synthesize(chunk)
+                except Exception:
+                    if player is None:
+                        raise
+                    break
+                if not produced:
+                    continue
+                audio, sr = produced
+                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if audio.size == 0:
+                    continue
+                if tts_local is not None:
+                    audio = tts_local.normalize_peak(audio)
+                if player is None:
+                    player = _LivePcmPlayer(self, int(sr))
+                else:
+                    player.push(np.zeros(max(1, int(player.sr * 0.04)), dtype=np.float32))
+                player.push(audio)
+        finally:
+            if player is not None:
+                player.finish()
+        if player is None or self.stop_speech_event.is_set():
+            return False
+        return player.samples > 0
+
+    def _speak_sapi(self, text):
+        """Последний фолбэк: системный голос Windows через SAPI5.
+
+        Каждая фраза пишется в wav и сразу ставится в воспроизведение,
+        следующая в это время ещё синтезируется.
+        """
+        chunks = (
+            tts_local.split_for_early_playback(text)
+            if tts_local is not None
+            else [text]
+        )
+
+        def synthesize(piece):
+            if self.stop_speech_event.is_set():
+                return None
+            return self._render_sapi_chunk(piece)
+
+        try:
+            return self._speak_synthesized_chunks(chunks, synthesize)
+        except Exception as err:
+            print(f"[SAPI5 Error]: {err}")
+            return False
+
+    def _render_sapi_chunk(self, text):
+        """Один фрагмент SAPI в float32. None — пусто, таймаут или прерывание."""
+        temp_wav = os.path.join(
+            tempfile.gettempdir(), f"fox_{os.getpid()}_{time.time_ns()}.wav"
+        )
+        box = {}
+
+        def _render():
             try:
                 ctypes.windll.ole32.CoInitialize(None)
                 engine = pyttsx3.init()
                 engine.setProperty("rate", self.config.get("tts_rate", 190))
                 engine.setProperty("volume", 1.0)
-
                 lang = self.config.get("language", "ru")
-                chosen_sapi = self.sapi_voices.get(lang) or self.sapi_voices.get("ru") or self.sapi_voices.get("en")
-                if chosen_sapi:
-                    engine.setProperty("voice", chosen_sapi)
-
+                chosen = self.sapi_voices.get(lang) or self.sapi_voices.get("ru") or self.sapi_voices.get("en")
+                if chosen:
+                    engine.setProperty("voice", chosen)
                 engine.save_to_file(text, temp_wav)
                 engine.runAndWait()
                 engine.stop()
+            except Exception as exc:
+                box["error"] = exc
             finally:
                 try:
                     ctypes.windll.ole32.CoUninitialize()
                 except Exception:
                     pass
 
+        worker = threading.Thread(target=_render, daemon=True)
+        worker.start()
+        worker.join(timeout=10.0)
+        if box.get("error"):
+            raise box["error"]
+        if worker.is_alive() or self.stop_speech_event.is_set():
+            return None
+        if not os.path.exists(temp_wav) or os.path.getsize(temp_wav) <= 44:
+            return None
         try:
-            t = threading.Thread(target=_render_sapi, daemon=True)
-            t.start()
-            t.join(timeout=10.0)
-
-            if not self.stop_speech_event.is_set() and os.path.exists(temp_wav) and os.path.getsize(temp_wav) > 44:
-                with wave.open(temp_wav, "rb") as wf:
-                    sr = wf.getframerate()
-                    ch = wf.getnchannels()
-                    raw = wf.readframes(wf.getnframes())
-
-                arr = np.frombuffer(raw, dtype=np.int16)
-                if ch > 1:
-                    arr = arr.reshape(-1, ch)[:, 0]
-                data = arr.astype(np.float32) / 32768.0
-                self._play_audio_array(data, sr)
-                try:
-                    os.remove(temp_wav)
-                except Exception:
-                    pass
-                return True
-        except Exception as err:
-            print(f"[SAPI5 Error]: {err}")
-        return False
+            with wave.open(temp_wav, "rb") as wf:
+                sr = wf.getframerate()
+                channels = wf.getnchannels()
+                raw = wf.readframes(wf.getnframes())
+        finally:
+            try:
+                os.remove(temp_wav)
+            except Exception:
+                pass
+        arr = np.frombuffer(raw, dtype=np.int16)
+        if channels > 1:
+            arr = arr.reshape(-1, channels)[:, 0]
+        return arr.astype(np.float32) / 32768.0, sr
 
     def speak(self, text):  
         speaker_label = self.t("ui_speaker_name", "🦊 Лисичка")  

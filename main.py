@@ -73,6 +73,11 @@ HUD_THEME = {
 
 NUM_BANDS = 28
 
+# Общий цикл реактора для базового и полного режима. Раньше слушающее окно
+# перерисовывалось каждые 22 мс (~45 кадров/с), тишина — каждые 50 мс.
+HUD_FRAME_MS = 80
+HUD_IDLE_FRAME_MS = 160
+
 LANG_OPTIONS = {
     "🇷🇺 Русский (RU)": "ru",
     "🇬🇧 English (EN)": "en"
@@ -955,17 +960,25 @@ class FoxAssistantApp(ctk.CTk):
     def animate_hud(self):
         w = self.canvas_reactor.winfo_width()
         h = self.canvas_reactor.winfo_height()
+        listening = bool(self.core.is_listening)
+        frame_ms = HUD_FRAME_MS if listening else HUD_IDLE_FRAME_MS
+        # Коэффициенты сглаживания подобраны под старый интервал кадра.
+        # Степень сохраняет ту же скорость реакции при более редкой перерисовке.
+        ref_ms = 22.0 if listening else 50.0
+        motion = frame_ms / ref_ms
+        heat_keep = 0.84 ** motion
+        spec_keep = 0.76 ** motion
 
         target_spectrum = self.core.latest_spectrum
         is_speaking = getattr(self.core, 'is_speaking', False)
         is_cat_locked = getattr(self.core, 'keyboard_locked', False)
         total_flux = float(np.sum(target_spectrum))
 
-        raw_heat = total_flux * 3.82 if self.core.is_listening else 0.0
-        self.smooth_heat = self.smooth_heat * 0.84 + raw_heat * 0.16
+        raw_heat = total_flux * 3.82 if listening else 0.0
+        self.smooth_heat = self.smooth_heat * heat_keep + raw_heat * (1.0 - heat_keep)
         for i in range(NUM_BANDS):
-            v_t = target_spectrum[i] if self.core.is_listening else 0.0
-            self.smooth_spectrum[i] = self.smooth_spectrum[i] * 0.76 + v_t * 0.24
+            v_t = target_spectrum[i] if listening else 0.0
+            self.smooth_spectrum[i] = self.smooth_spectrum[i] * spec_keep + v_t * (1.0 - spec_keep)
 
         cw = self.canvas_telemetry.winfo_width()
         ch = self.canvas_telemetry.winfo_height()
@@ -1021,11 +1034,11 @@ class FoxAssistantApp(ctk.CTk):
             for bar_i in range(12):
                 bx = eq_x + bar_i * 5
                 self.canvas_telemetry.create_line(bx, y_base, bx, y_base - max_eq_h, fill=HUD_THEME["text_dark"], width=2)
-                bh_val = max(1, int(self.smooth_spectrum[bar_i] * max_eq_h)) if self.core.is_listening else 1
-                b_color = HUD_THEME["hud_cyan"] if self.core.is_listening else HUD_THEME["panel_border"]
+                bh_val = max(1, int(self.smooth_spectrum[bar_i] * max_eq_h)) if listening else 1
+                b_color = HUD_THEME["hud_cyan"] if listening else HUD_THEME["panel_border"]
                 self.canvas_telemetry.create_line(bx, y_base, bx, y_base - bh_val, fill=b_color, width=2)
 
-            heat_display = self.smooth_heat if self.core.is_listening else 0.0
+            heat_display = self.smooth_heat if listening else 0.0
             self.canvas_telemetry.create_text(
                 10, 92, text=f"🔥 ТЕПЛО: {heat_display:5.2f} KTS",
                 font=("Consolas", 8, "bold"), fill="#FFB703", anchor="w"
@@ -1054,13 +1067,13 @@ class FoxAssistantApp(ctk.CTk):
             for gy in range(0, int(h), grid_gap):
                 self.canvas_reactor.create_line(0, gy, w, gy, fill="#0A0E15", width=1)
 
-            self.scanline_y = (self.scanline_y + 1.8) % h
+            self.scanline_y = (self.scanline_y + 1.8 * motion) % h
             self.canvas_reactor.create_line(0, self.scanline_y, w, self.scanline_y, fill=HUD_THEME["hud_cyan_dim"], width=1)
 
             clock_name = self.t("clock_prefix", "ЛИСЬЕ_ВРЕМЯ")
             self.hud_clock_lbl.configure(text=f"{clock_name}: {time.strftime('%H:%M:%S')}")
 
-            if not self.core.is_listening:
+            if not listening:
                 if getattr(self, "fox_avatar_dim_tk", None):
                     self.canvas_reactor.create_image(cx, cy - 6, image=self.fox_avatar_dim_tk)
                 elif self.fox_avatar_tk:
@@ -1076,12 +1089,12 @@ class FoxAssistantApp(ctk.CTk):
                         cx, cy + (min(w, h) * 0.40), text=f"[ {status_standby} // STANDBY ]",
                         font=("Consolas", 10, "bold"), fill=HUD_THEME["text_dim"]
                     )
-                self.after(50, self.animate_hud)
+                self.after(frame_ms, self.animate_hud)
                 return
 
-            self.flame_time += 0.085
-            self.rot_ring_inner += 0.016
-            self.rot_ring_outer -= 0.011
+            self.flame_time += 0.085 * motion
+            self.rot_ring_inner += 0.016 * motion
+            self.rot_ring_outer -= 0.011 * motion
 
             low_energy = float(np.mean(target_spectrum[:6])) if len(target_spectrum) >= 6 else 0.0
 
@@ -1198,7 +1211,7 @@ class FoxAssistantApp(ctk.CTk):
             self.canvas_reactor.create_line(pad, h - pad - sz, pad, h - pad - 6, pad + 6, h - pad, pad + sz, h - pad, fill=HUD_THEME["hud_cyan"], width=2)
             self.canvas_reactor.create_line(w - pad - sz, h - pad, w - pad - 6, h - pad, w - pad, h - pad - 6, w - pad, h - pad - sz, fill=HUD_THEME["hud_cyan"], width=2)
 
-        self.after(22, self.animate_hud)
+        self.after(frame_ms, self.animate_hud)
 
     # =========================================================================
     # РЕДАКТОР СВИТКА ПОВАДОК (МУЛЬТИ-ШАГОВЫЙ КОНСТРУКТОР)
