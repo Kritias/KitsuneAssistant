@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import warnings
@@ -479,6 +480,23 @@ class SileroEngine:
 
     name = "silero"
 
+    # Фронтенд Silero молча выбрасывает цифры: «курс 83018 долларов» звучит
+    # как «курс долларов». Числа и время переводим в слова заранее.
+    #: Целые: «83018» → «восемьдесят три тысячи восемнадцать».
+    _RE_INT = re.compile(r"\d{1,12}")
+    #: Десятичные дроби: «6,94»/«6.94» → «шесть целых девяносто четыре сотых».
+    _RE_DEC = re.compile(r"\d{1,12}[.,]\d{1,4}")
+    #: Часы: «21:35» → «двадцать один час тридцать пять минут».
+    _RE_TIME = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+    #: Годы/индексы/номера: «2026», «312» → по одной цифре («три один два»).
+    _RE_DIGITS = re.compile(r"\d+\b")
+    #: Число перед валютой: «83018 долларов» → количественное чтение.
+    _RE_CURRENCY = re.compile(
+        r"(\d{1,12})\s+"
+        r"(доллар\w*|рубл\w*|евро|цент\w*|копе\w*|тысяч\w*|миллион\w*|миллиард\w*)",
+        re.IGNORECASE,
+    )
+
     def __init__(self, directory: str | None = None, speaker: str = ""):
         import torch
 
@@ -512,11 +530,170 @@ class SileroEngine:
 
     def synthesize(self, text: str):
         """Возвращает (numpy float32 mono в [-1, 1], частота дискретизации)."""
+        text = self._spoken_numbers(text)
         with self._torch.no_grad():
             audio = self._model.apply_tts(
                 text=text, speaker=self.speaker, sample_rate=self.sample_rate
             )
         return audio.detach().cpu().numpy().astype("float32"), self.sample_rate
+
+    # ------------------------------------------------------------------
+    # Числа словами: фронтенд Silero молча теряет цифры
+    # ------------------------------------------------------------------
+
+    _RU_UNITS = (
+        ("миллиард", "миллиарда", "миллиардов", "муж"),
+        ("миллион", "миллиона", "миллионов", "муж"),
+        ("тысяча", "тысячи", "тысяч", "жен"),
+    )
+    _RU_ONES = (
+        "", "один", "два", "три", "четыре", "пять", "шесть", "семь",
+        "восемь", "девять",
+    )
+    _RU_ONES_F = (
+        "", "одна", "две", "три", "четыре", "пять", "шесть", "семь",
+        "восемь", "девять",
+    )
+    _RU_TEENS = (
+        "десять", "одиннадцать", "двенадцать", "тринадцать", "четырнадцать",
+        "пятнадцать", "шестнадцать", "семнадцать", "восемнадцать",
+        "девятнадцать",
+    )
+    _RU_TENS = (
+        "", "", "двадцать", "тридцать", "сорок", "пятьдесят", "шестьдесят",
+        "семьдесят", "восемьдесят", "девяносто",
+    )
+    _RU_HUNDREDS = (
+        "", "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот",
+        "семьсот", "восемьсот", "девятьсот",
+    )
+    _RU_FRACTIONS_F = (
+        "десятая", "сотая", "тысячная", "десятитысячная",
+    )
+    _RU_FRACTIONS_M = (
+        "десятая", "сотая", "тысячная", "десятитысячная",
+    )
+
+    @classmethod
+    def _plural_form(cls, number: int, forms: tuple) -> str:
+        """Русское согласование: 1 рубль, 2 рубля, 5 рублей."""
+        number = abs(number) % 100
+        if 11 <= number <= 14:
+            return forms[2]
+        number %= 10
+        if number == 1:
+            return forms[0]
+        if 2 <= number <= 4:
+            return forms[1]
+        return forms[2]
+
+    @classmethod
+    def _int_to_words(cls, value: int, gender: str = "муж") -> str:
+        """Целое число словами: 83018 → «восемьдесят три тысячи восемнадцать»."""
+        if value == 0:
+            return "ноль"
+        parts: list[str] = []
+        scale = 1_000_000_000
+        unit_idx = 0  # 0 — миллиарды, 1 — миллионы, 2 — тысячи
+        while scale > 1:
+            if value >= scale:
+                group, value = divmod(value, scale)
+                fem = cls._RU_UNITS[unit_idx][3] == "жен"
+                words = cls._group_to_words(group, fem)
+                form = cls._plural_form(group, cls._RU_UNITS[unit_idx])
+                parts.append(f"{words} {form}")
+            scale //= 1000
+            unit_idx += 1
+        if value or not parts:
+            parts.append(cls._group_to_words(value, gender == "жен"))
+        return " ".join(p for p in parts if p)
+
+    @classmethod
+    def _group_to_words(cls, value: int, feminine: bool = False) -> str:
+        """Три разряда словами. ``feminine`` — «две тысячи», а не «два тысячи»."""
+        parts = []
+        hundreds, rest = divmod(value, 100)
+        if hundreds:
+            parts.append(cls._RU_HUNDREDS[hundreds])
+        tens = rest // 10
+        ones = rest % 10
+        if tens == 1:
+            parts.append(cls._RU_TEENS[ones])
+        else:
+            if tens:
+                parts.append(cls._RU_TENS[tens])
+            if ones:
+                parts.append(cls._RU_ONES_F[ones] if feminine else cls._RU_ONES[ones])
+        return " ".join(parts)
+
+    @classmethod
+    def _decimal_to_words(cls, whole: str, frac: str) -> str:
+        """Дробь словами: «6,94» → «шесть целых девяносто четыре сотых».
+
+        Род целой части — по правилам «одна целая / две целых»: женский род
+        только для 1–4 в конце (кроме 11–14), иначе мужской. Слово «целых»
+        неизменно, а дробная часть согласуется как существительное.
+        """
+        whole_num = int(whole)
+        feminine = whole_num % 100 in (1, 2, 3, 4)
+        whole_words = cls._int_to_words(whole_num, "жен" if feminine else "муж")
+        whole_form = (
+            "целая" if feminine and whole_num % 10 == 1 and whole_num % 100 != 11
+            else "целых"
+        )
+        frac_words = cls._int_to_words(int(frac), "жен")
+        frac_idx = min(max(len(frac), 1), len(cls._RU_FRACTIONS_F)) - 1
+        frac_base = cls._RU_FRACTIONS_F[frac_idx]
+        frac_gen = frac_base.replace("ая", "ых")
+        frac_form = cls._plural_form(int(frac), (frac_base, frac_gen, frac_gen))
+        return f"{whole_words} {whole_form} {frac_words} {frac_form}"
+
+    @classmethod
+    def _spoken_numbers(cls, text: str) -> str:
+        """Заменяет числа на их произношение словами.
+
+        Порядок важен: сначала дроби (чтобы точку в «6.94» не съел целочисленный
+        проход), затем время, затем целые; порядковые контексты («серия 312»)
+        уходят в поразрядное чтение — как и принято для номеров.
+        """
+        if not isinstance(text, str) or not any(ch.isdigit() for ch in text):
+            return text
+
+        def frac_sub(match):
+            raw = match.group(0).replace(",", ".")
+            whole, frac = raw.split(".")
+            return cls._decimal_to_words(whole, frac)
+
+        def time_sub(match):
+            hours, minutes = int(match.group(1)), int(match.group(2))
+            if hours > 23 or minutes > 59:
+                return match.group(0)
+            hour_form = cls._plural_form(hours, ("час", "часа", "часов"))
+            min_form = cls._plural_form(minutes, ("минута", "минуты", "минут"))
+            return (
+                f"{cls._int_to_words(hours)} {hour_form} "
+                f"{cls._int_to_words(minutes)} {min_form}"
+            )
+
+        def digits_sub(match):
+            raw = match.group(0)
+            # Длинные номера и годы читаем по цифрам — так делают люди.
+            words = ("ноль один два три четыре пять шесть семь восемь девять").split()
+            return " ".join(words[int(ch)] for ch in raw)
+
+        def currency_sub(match):
+            # Денежные суммы читают количественно: «восемьдесят три тысячи
+            # восемнадцать долларов», а не по цифрам.
+            return cls._int_to_words(int(match.group(1))) + " " + match.group(2)
+
+        # Порядок важен: сначала дроби (иначе валютный проход съест «94»
+        # из «6,94 доллара» как целое), затем время и денежные суммы,
+        # в конце — остатки цифр поразрядно.
+        text = cls._RE_DEC.sub(frac_sub, text)
+        text = cls._RE_TIME.sub(time_sub, text)
+        text = cls._RE_CURRENCY.sub(currency_sub, text)
+        text = cls._RE_DIGITS.sub(digits_sub, text)
+        return text
 
 
 class KokoroEngine:
