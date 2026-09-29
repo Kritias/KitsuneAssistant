@@ -483,28 +483,15 @@
                 }
             ]
         },
-        "bitcoin rate": {
-            "synonyms": [
-                "bitcoin price",
-                "how much is bitcoin",
-                "btc rate",
-                "price of bitcoin",
-                "bitcoin"
-            ],
-            "steps": [
-                {
-                    "action": "crypto_rate",
-                    "value": "BTC"
-                }
-            ]
-        },
         "crypto rate": {
             "synonyms": [
                 "rate of {coin}",
                 "price of {coin}",
                 "how much is {coin}",
                 "{coin} price",
-                "what is {coin} worth"
+                "what is {coin} worth",
+                "{coin} rate",
+                "how much {coin} costs"
             ],
             "slots": {
                 "coin": {

@@ -113,6 +113,41 @@ EN_SPOKEN_DIGITS = (
     "eight", "nine",
 )
 
+# ===========================================================================
+# РЕЖИМЫ ПРИЛОЖЕНИЯ: базовый (без тяжёлых моделей) и полный
+# ===========================================================================
+#: Базовый режим: STT — только Vosk, синтез — edge-tts/SAPI. Тяжёлые модели
+#: (whisper на CUDA, Silero, kokoro) не выбираются и не качаются: приложение
+#: остаётся лёгким, как при первом запуске.
+MODE_BASIC = "basic"
+MODE_FULL = "full"
+#: Значения, которые принимает конфиг и принудительно выставляет каждый режим.
+_FULL_ASR_DEFAULT = "auto"
+_BASIC_DEFAULTS = {
+    "asr_engine": "vosk",
+    "tts_engine": "auto",  # auto в базовом режиме раскрывается в edge-tts
+}
+_FULL_DEFAULTS = {
+    "asr_engine": _FULL_ASR_DEFAULT,
+    "tts_engine": "auto",
+}
+
+
+def apply_mode_defaults(config, full_mode: bool):
+    """Приводит поля движков конфига к значениям выбранного режима.
+
+    Переключение режима переписывает выбор движков: в базовом это vosk и
+    auto-синтез (локальные модели не участвуют), в полном — авто-выбор,
+    который сам поднимет whisper/Silero/kokoro по железу. Прочие настройки
+    (словарь, пороги, голосовые ключи) не трогаются, чтобы при возврате
+    в полный режим ничего не пришлось выставлять заново.
+    """
+    config["full_mode"] = bool(full_mode)
+    defaults = _FULL_DEFAULTS if full_mode else _BASIC_DEFAULTS
+    for key, value in defaults.items():
+        config[key] = value
+    return config
+
 
 def canonical_number(digits):
     """Убирает ведущие нули.
@@ -211,6 +246,9 @@ DEFAULT_CONFIG = {
     "asr_chitchat_threshold": 70,
     "asr_chitchat_strong": 75,
     "asr_engine": "auto",
+    # false — базовый режим: STT только Vosk, синтез без локальных моделей.
+    # Первый запуск всегда базовый; полный включается кнопкой в «О лисе».
+    "full_mode": False,
     "asr_mute_while_speaking": True,
     "whisper_model": "large-v3-turbo",
     "whisper_compute_type": "",
@@ -532,6 +570,11 @@ class FoxAssistantCore:
             self._log_asr("Движок задан вручную: Vosk (CPU)")
             return
 
+        # Базовый режим: whisper не участвует, как бы ни просил конфиг.
+        if not self.config.get("full_mode", False):
+            self._log_asr("Базовый режим: распознавание на Vosk (CPU)")
+            return
+
         available, reason = asr_whisper.whisper_available()
         if not available:
             self._log_asr(f"{reason} — работаю на Vosk (CPU)")
@@ -617,9 +660,15 @@ class FoxAssistantCore:
         """Основной поток: ручной выбор → Silero (torch + CUDA) → kokoro (ONNX).
 
         Если недоступно ничего, озвучка остаётся сетевой: edge-tts, затем SAPI5.
+        В базовом режиме локальный синтез не выбирается и модели не качаются.
         """
         if tts_local is None:
             self._log_tts("Модуль локального синтеза недоступен — работаю через edge-tts")
+            return
+
+        if not self.config.get("full_mode", False):
+            self.tts_local_name = ""
+            self._log_tts("Базовый режим: озвучка через edge-tts")
             return
 
         name, reason = tts_local.choose_engine(self.config, self.tts_models_dir())
@@ -704,11 +753,18 @@ class FoxAssistantCore:
 
         Пока модель грузится в фоне, локальный движок вернёт None, и озвучка
         сразу уйдёт на edge-tts, а после загрузки начнёт работать локально.
+        В базовом режиме локальных движков нет вовсе: auto — это сразу
+        edge-tts, и модели не скачиваются.
         """
         want = str(self.config.get("tts_engine", "auto")).lower()
         if want == "pyttsx3":
             return ["pyttsx3"]
         if want == "edge-tts":
+            return ["edge-tts", "pyttsx3"]
+
+        if not self.config.get("full_mode", False):
+            # Базовый режим: silero/kokoro не озвучивают, что бы ни было
+            # в конфиге, и не подтягиваются фоновыми загрузками.
             return ["edge-tts", "pyttsx3"]
 
         if want == "silero":
@@ -923,6 +979,12 @@ class FoxAssistantCore:
             config["wake_aliases"] = []
         config["wake_word"] = str(config.get("wake_word") or "лисичка")
         config["language"] = str(config.get("language") or "ru")
+        config["full_mode"] = bool(config.get("full_mode", False))
+        if not config["full_mode"]:
+            # Базовый режим — рамка: ручная правка конфига (whisper, silero)
+            # не должна воскрешать тяжёлые движки. Полный режим, наоборот,
+            # сохраняет пользовательский выбор как есть.
+            apply_mode_defaults(config, False)
         return config
 
     def save_config(self):  
@@ -1563,27 +1625,46 @@ class FoxAssistantCore:
         стоять не в самом начале: «включи саус парк 312» должно разобрать как
         шаблон «саус парк» плюс номер. Значение слота — всегда конец фразы,
         поэтому за окном должно остаться хоть одно слово.
+
+        Шаблон бывает и без префикса («{coin} курс», «{coin} price»): тогда
+        ищется суффикс, а слот — всё, что перед ним.
         """
         prefix_words = prefix.split()
-        if not prefix_words:
+        suffix_words = suffix.split()
+        if not prefix_words and not suffix_words:
             return None, 0
-        base = len(prefix_words)
+
         best = None  # (счёт, индекс конца шаблона)
-        for size in (base, base + 1, base - 1):
-            if size < 1:
-                continue
+
+        if not prefix_words:
+            # Только суффикс: окно суффикса идёт по всей фразе, слот — до него.
+            size = len(suffix_words)
             for start in range(0, len(words) - size + 1):
-                if start + size >= len(words):
-                    continue  # за шаблоном должно остаться значение слота
-                score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
+                if start == 0:
+                    continue  # перед суффиксом должно быть значение слота
+                score = fuzz.ratio(" ".join(words[start:start + size]), suffix)
                 if best is None or score > best[0]:
-                    best = (score, start + size)
+                    best = (score, start)
+        else:
+            base = len(prefix_words)
+            for size in (base, base + 1, base - 1):
+                if size < 1:
+                    continue
+                for start in range(0, len(words) - size + 1):
+                    if start + size >= len(words):
+                        continue  # за шаблоном должно остаться значение слота
+                    score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
+                    if best is None or score > best[0]:
+                        best = (score, start + size)
         if best is None or best[0] < SLOT_PREFIX_THRESHOLD:
             return None, 0
 
-        tail = words[best[1]:]
-        suffix_words = suffix.split()
-        if suffix_words:
+        # В префиксной ветке best[1] — конец шаблона: хвост после него.
+        # В суффиксной (best = (score, start)) best[1] — начало суффикса,
+        # и хвост — всё, что до него; сам суффикс туда не входит, вычитать
+        # его второй раз нельзя.
+        tail = words[best[1]:] if prefix_words else words[:best[1]]
+        if prefix_words and suffix_words:
             if len(tail) <= len(suffix_words):
                 return None, 0
             literal = " ".join(tail[-len(suffix_words):])
