@@ -96,6 +96,7 @@
     "ui_screenshot_tag": "🐾 Trace",
     "ui_skills_tag": "🦊 Skills",
     "ui_mic_tag": "🎙️ Microphone",
+    "ui_voice_tag": "🔊 Voice",
     "about_window_title": "About Fox",
     "about_header_text": "Fox Version",
     "about_desc_text": "Cyberpunk voice assistant featuring two speech recognition engines:\n\n• Vosk (CPU): Fast local offline recognition powered by Kaldi (model {vosk_ver}), ensuring instant response without cloud dependencies.\n\n• Whisper (GPU): Advanced neural speech model by OpenAI (version {whisper_ver}) with GPU (CUDA) acceleration for maximum accuracy.",
