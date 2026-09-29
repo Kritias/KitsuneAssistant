@@ -74,6 +74,10 @@ KOKORO_SHARED_PATTERNS = [
     "voices/dima.bin",
 ]
 
+#: Размер модели омографов для текстового фронтенда. Должен совпадать с тем,
+#: что запрашивает ru_g2p.py, иначе при первом синтезе докачается вторая модель.
+KOKORO_OMOGRAPH_SIZE = "turbo3.1"
+
 #: Пакеты, без которых путь kokoro не заработает. espeakng-loader даёт
 #: бинарник eSpeak, который нужен misaki и phonemizer.
 KOKORO_PACKAGES = (
@@ -101,6 +105,80 @@ def kokoro_model_rel(voice: str, prefer_quantized: bool = False) -> str:
 
 def _kokoro_root(directory: str | None = None) -> str:
     return os.path.join(models_dir(directory), "kokoro")
+
+
+def ruaccent_root() -> str | None:
+    """Каталог пакета ruaccent или None, если пакета нет."""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("ruaccent")
+    except Exception:
+        return None
+    if spec is None or not spec.origin:
+        return None
+    return os.path.dirname(spec.origin)
+
+
+def kokoro_accent_paths() -> list[str]:
+    """Что ruaccent докачивает с HuggingFace при построении движка.
+
+    Текстовый фронтенд kokoro (ruaccent) идёт в HuggingFace за моделью ударений
+    и складывает её **внутрь своего пакета**, а не в наш каталог моделей. Это
+    отдельная загрузка: `snapshot_download` репозитория kokoro-ru её не делает.
+    Без неё движок не поднимается вообще, поэтому её надо и проверять, и
+    догружать заранее.
+    """
+    root = ruaccent_root()
+    if not root:
+        return []
+    return [
+        os.path.join(root, "dictionary"),
+        os.path.join(root, "nn", "nn_omograph", KOKORO_OMOGRAPH_SIZE),
+        os.path.join(root, "koziev"),
+    ]
+
+
+def kokoro_accent_ready() -> bool:
+    """Скачана ли модель ударений. Проверка без сети и без импорта ruaccent."""
+    paths = kokoro_accent_paths()
+    return bool(paths) and all(os.path.exists(path) for path in paths)
+
+
+def prepare_kokoro_accent(
+    directory: str | None = None, progress=None
+) -> tuple[bool, str]:
+    """Догружает модель ударений для фронтенда kokoro. Исключений не бросает.
+
+    Загрузка разовая, и раньше её не делал никто: она случалась при построении
+    движка, то есть при первой фразе. Если сети нет, движок просто не
+    поднимался, и это выглядело как «kokoro не работает» без объяснения.
+    """
+    if kokoro_accent_ready():
+        return True, ""
+    if not _can_import("ruaccent"):
+        return False, "нет пакета ruaccent"
+
+    root = _kokoro_root(directory)
+    if progress:
+        progress("Догружаю модель ударений ruaccent (один раз, нужен huggingface.co)")
+    try:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from ru_g2p import RuG2P
+
+        # Достаточно собрать фронтенд: он сам скачает всё, чего ему не хватает.
+        RuG2P(
+            espeak_data=os.path.join(root, "espeak-data"),
+            vocab_path=os.path.join(root, "kokoro-config.json"),
+            omograph_model_size=KOKORO_OMOGRAPH_SIZE,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if kokoro_accent_ready():
+        return True, ""
+    return False, "файлы не появились после загрузки"
 
 
 def _patch_g2p_encoding(root: str) -> None:
@@ -218,6 +296,10 @@ def kokoro_available(
     for path in needed:
         if not os.path.isfile(path):
             return False, f"нет файла {os.path.relpath(path, root)}"
+    # Модель ударений лежит в пакете ruaccent и качается отдельно: без неё
+    # движок не построится, значит и «готов» говорить рано.
+    if not kokoro_accent_ready():
+        return False, "модель ударений не скачана (нужен доступ к huggingface.co)"
     return True, ""
 
 
@@ -248,7 +330,9 @@ def downloadable_engines(config: dict, directory: str | None = None) -> list[str
             _kokoro_root(directory),
             kokoro_model_rel(KOKORO_DEFAULT_VOICE, _prefer_quantized(config)),
         )
-        if not os.path.isfile(model):
+        # Модель ударений качается отдельно от самой модели синтеза, поэтому
+        # «файл на месте» ещё не значит «готово».
+        if not os.path.isfile(model) or not kokoro_accent_ready():
             engines.append("kokoro")
     return engines
 
@@ -327,34 +411,45 @@ def download_silero(directory: str | None = None, progress=None) -> bool:
 def download_kokoro(
     directory: str | None = None, progress=None, prefer_quantized: bool = False
 ) -> bool:
-    """Скачивает ассеты kokoro-ru через huggingface_hub. Исключений не бросает."""
+    """Скачивает ассеты kokoro-ru. Исключений не бросает.
+
+    Кроме репозитория модели догружает модель ударений для текстового
+    фронтенда: без неё движок не построится, а раньше эта загрузка случалась
+    неожиданно при первой фразе и молча падала без сети.
+    """
     root = _kokoro_root(directory)
     model_file = kokoro_model_rel(KOKORO_DEFAULT_VOICE, prefer_quantized)
+
     if os.path.isfile(os.path.join(root, model_file)):
         _patch_g2p_encoding(root)
-        return True
-    if not _can_import("huggingface_hub"):
-        _log("Загрузка kokoro невозможна: нет пакета huggingface_hub")
-        return False
+    else:
+        if not _can_import("huggingface_hub"):
+            _log("Загрузка kokoro невозможна: нет пакета huggingface_hub")
+            return False
 
-    try:
-        from huggingface_hub import snapshot_download
+        try:
+            from huggingface_hub import snapshot_download
 
-        if progress:
-            size = "138 МБ" if prefer_quantized else "326 МБ"
-            progress(f"Скачиваю модель kokoro (один раз, {size})")
-        os.makedirs(root, exist_ok=True)
-        snapshot_download(
-            repo_id=KOKORO_REPO,
-            local_dir=root,
-            allow_patterns=KOKORO_SHARED_PATTERNS + [model_file],
-        )
-        _patch_g2p_encoding(root)
-        _log(f"Модель kokoro загружена: {root}")
-        return True
-    except Exception as exc:
-        _log(f"Не удалось скачать модель kokoro: {exc}")
+            if progress:
+                size = "138 МБ" if prefer_quantized else "326 МБ"
+                progress(f"Скачиваю модель kokoro (один раз, {size})")
+            os.makedirs(root, exist_ok=True)
+            snapshot_download(
+                repo_id=KOKORO_REPO,
+                local_dir=root,
+                allow_patterns=KOKORO_SHARED_PATTERNS + [model_file],
+            )
+            _patch_g2p_encoding(root)
+            _log(f"Модель kokoro загружена: {root}")
+        except Exception as exc:
+            _log(f"Не удалось скачать модель kokoro: {exc}")
+            return False
+
+    accent_ok, accent_reason = prepare_kokoro_accent(directory, progress)
+    if not accent_ok:
+        _log(f"Модель ударений для kokoro не загрузилась: {accent_reason}")
         return False
+    return True
 
 
 def ensure_kokoro_model(
@@ -458,6 +553,7 @@ class KokoroEngine:
         self._g2p = RuG2P(
             espeak_data=os.path.join(root, "espeak-data"),
             vocab_path=os.path.join(root, "kokoro-config.json"),
+            omograph_model_size=KOKORO_OMOGRAPH_SIZE,
         )
         with open(os.path.join(root, "config.json"), encoding="utf-8") as handle:
             self._vocab = json.load(handle)["vocab"]
