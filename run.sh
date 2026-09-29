@@ -71,7 +71,7 @@ find_system_python() {
     local candidate
     for candidate in python3 python py; do
         if command -v "$candidate" >/dev/null 2>&1 \
-           && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+           && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
             echo "$candidate"
             return 0
         fi
@@ -80,7 +80,7 @@ find_system_python() {
 }
 
 if ! SYSTEM_PYTHON="$(find_system_python)"; then
-    echo "❌ Не найден Python 3.9 или новее." >&2
+    echo "❌ Не найден Python 3.12 или новее." >&2
     echo "   Установи Python с https://www.python.org/downloads/ и включи опцию 'Add python.exe to PATH'." >&2
     exit 1
 fi

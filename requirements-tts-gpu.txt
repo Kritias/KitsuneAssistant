@@ -19,18 +19,23 @@
 # Установка вручную:
 #     .venv\Scripts\python.exe -m pip install -r requirements-tts-gpu.txt
 #     .venv\Scripts\python.exe tts_local.py silero     # скачать модель
+#
+# Версии зафиксированы по проверенному рабочему окружению (.venv).
 
 --index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.org/simple
 
-torch>=2.2.0
+# Проверенная сборка — 2.14.0+cu126 с индекса PyTorch. Спецификатор без
+# локальной метки (==2.14.0) намеренно матчит и +cu126: так зафиксирована
+# версия, но выбор CUDA-метки остаётся за --index-url выше.
+torch==2.14.0
 
 # Сам код модели Silero v5 внутри .pt использует scipy (ресемплинг и эквалайзер),
 # поэтому без него движок не поднимется: torch.package распаковывает модель,
 # а её apply_tts упирается в ImportError.
-scipy>=1.10.0
+scipy==1.18.1
 
 # Пакет silero в рантайме не используется — модель грузится прямо из .pt через
 # torch.package. Оставлен ради CLI и диагностики, стоит копейки рядом с torch.
-silero>=0.5.5
-omegaconf>=2.3.0
+silero==0.5.5
+omegaconf==2.3.1

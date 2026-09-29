@@ -54,13 +54,18 @@ exit /b 0
 :endparse
 
 REM --- 1. Find a system Python ------------------------------------------------
+REM Проверяем именно версию, а не только наличие: версии в requirements.txt
+REM зафиксированы под колёса cp312, и на старом Python pip падает с невнятной
+REM ошибкой вместо понятного «нужен Python 3.12».
+set "PY_VERSION_TEST=import sys;sys.exit(0 if sys.version_info>=(3,12) else 1)"
+
 set "SYSTEM_PY="
-where python >nul 2>nul && set "SYSTEM_PY=python"
+where python >nul 2>nul && python -c "%PY_VERSION_TEST%" >nul 2>nul && set "SYSTEM_PY=python"
 if not defined SYSTEM_PY (
-    where py >nul 2>nul && set "SYSTEM_PY=py -3"
+    where py >nul 2>nul && py -3 -c "%PY_VERSION_TEST%" >nul 2>nul && set "SYSTEM_PY=py -3"
 )
 if not defined SYSTEM_PY (
-    echo [ERROR] Python 3.9+ not found in PATH.
+    echo [ERROR] Python 3.12+ not found in PATH.
     echo         Install it from https://www.python.org/downloads/ and enable
     echo         the "Add python.exe to PATH" option.
     exit /b 1
