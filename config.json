@@ -24,7 +24,7 @@
     "icon_sleep_never": "resources/icon_never.png",
     "language": "ru",
     "microphone": "",
-    "asr_grammar": true,
+    "asr_grammar": false,
     "asr_grammar_extra": [],
     "asr_debug": false,
     "asr_cmd_threshold": 70,

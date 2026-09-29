@@ -12,10 +12,12 @@ import pystray
 from pystray import MenuItem as item
 import numpy as np
 
+# --- Версии компонентов ---
+APP_VERSION = "0.1"
+VOSK_MODEL_VERSION = "vosk-model-small-ru-0.22"
+WHISPER_VERSION = "faster-whisper-1.2.1"
+
 # --- Принудительный UTF-8 для консоли ---------------------------------------
-# На Windows консоль часто работает в cp866/cp1252, и любой print() с русским
-# текстом (например, лог загрузки модели Vosk) падает с UnicodeEncodeError.
-# Под pythonw.exe потоки stdout/stderr отсутствуют — проверяем на None.
 if os.name == "nt" and sys.stdout is not None:
     os.system("chcp 65001 >nul 2>&1")
 
@@ -149,14 +151,43 @@ class FoxAssistantApp(ctk.CTk):
         return self.lang.get(key, default if default else key)
 
     def get_available_input_devices(self):
-        """Список устройств ввода: [(индекс, название), ...]."""
         devices = []
+        seen_names = set()
+        blacklist = [
+            "первичный драйвер",
+            "primary sound capture",
+            "переназначение",
+            "mapper",
+            "@system32",
+            "input ()"
+        ]
         try:
             import sounddevice as sd
             devs = sd.query_devices()
+            hostapis = sd.query_hostapis()
+            
+            wasapi_id = None
+            for h_idx, h in enumerate(hostapis):
+                if 'WASAPI' in h.get('name', ''):
+                    wasapi_id = h_idx
+                    break
+            
             for idx, dev in enumerate(devs):
                 if dev['max_input_channels'] > 0:
-                    devices.append((idx, dev['name']))
+                    if wasapi_id is not None and dev['hostapi'] != wasapi_id:
+                        continue
+                    
+                    name = dev['name'].strip()
+                    if not name or name == "()":
+                        continue
+                        
+                    name_lower = name.lower()
+                    if any(bad in name_lower for bad in blacklist):
+                        continue
+                        
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        devices.append((idx, name))
         except Exception:
             pass
         return devices
@@ -410,7 +441,6 @@ class FoxAssistantApp(ctk.CTk):
         os._exit(0)
 
     def _set_engine_combo(self, engine_value):
-        """Выставляет в списке движок распознавания по его внутреннему значению."""
         wanted = str(engine_value).lower()
         for label, value in self.asr_engine_values.items():
             if value == wanted:
@@ -418,10 +448,61 @@ class FoxAssistantApp(ctk.CTk):
                 return
         self.combo_asr_engine.set(list(self.asr_engine_values.keys())[0])
 
+    def open_about_window(self):
+        about_win = ctk.CTkToplevel(self)
+        about_win.title(self.t("about_window_title"))
+        about_win.geometry("460x610")
+        about_win.configure(fg_color=HUD_THEME["chassis_dark"])
+        about_win.resizable(False, False)
+        about_win.grab_set()
+
+        card = ctk.CTkFrame(
+            about_win, fg_color=HUD_THEME["panel_card"],
+            border_color=HUD_THEME["panel_border"], border_width=1.5,
+            corner_radius=12
+        )
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        avatar_lbl = ctk.CTkLabel(card, text="")
+        avatar_lbl.pack(pady=(20, 10))
+        if getattr(self, "fox_avatar_tk", None):
+            avatar_lbl.configure(image=self.fox_avatar_tk)
+        else:
+            avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
+
+        lbl_ver = ctk.CTkLabel(
+            card, text=f"🦊 KITSUNE // {self.t('about_header_text')} {APP_VERSION}",
+            font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+            text_color="#FFB703"
+        )
+        lbl_ver.pack(pady=(0, 15))
+
+        desc_text = self.t("about_desc_text").format(
+            vosk_ver=VOSK_MODEL_VERSION,
+            whisper_ver=WHISPER_VERSION
+        )
+        lbl_desc = ctk.CTkLabel(
+            card, text=desc_text,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            text_color=HUD_THEME["text_bright"],
+            justify="left", wraplength=390
+        )
+        lbl_desc.pack(padx=20, pady=(0, 20))
+
+        btn_close = ctk.CTkButton(
+            card, text=self.t("about_close_btn"),
+            fg_color="#FB8500", hover_color="#D94400",
+            text_color=HUD_THEME["chassis_dark"],
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=32, corner_radius=6,
+            command=about_win.destroy
+        )
+        btn_close.pack(pady=(0, 20))
+
     def retranslate_ui(self):
         self.title(self.t("app_title"))
         self.lbl_logo_title.configure(text=self.t("app_brand"))
-        self.lbl_logo_subtitle.configure(text=self.t("app_subtitle"))
+        self.lbl_logo_subtitle.configure(text=self.t("app_subtitle").format(version=APP_VERSION))
 
         self.nav_btns["chat"].configure(text=self.t("nav_chat"))
         self.nav_btns["editor"].configure(text=self.t("nav_editor"))
@@ -470,7 +551,7 @@ class FoxAssistantApp(ctk.CTk):
         self.check_grammar.configure(text=self.t("settings_chk_grammar"))
         self.check_asr_debug.configure(text=self.t("settings_chk_asr_debug"))
         self.lbl_settings_asr_engine.configure(text=self.t("settings_lbl_asr_engine"))
-        # Подписи движка переводятся, а значения остаются стабильными
+        
         current_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
         self.asr_engine_values = {
             self.t("asr_engine_auto"): "auto",
@@ -550,10 +631,16 @@ class FoxAssistantApp(ctk.CTk):
         )
         self.lbl_logo_title.pack(anchor="w")
 
-        self.lbl_logo_subtitle = ctk.CTkLabel(
-            logo_card, text=self.t("app_subtitle"), 
-            font=ctk.CTkFont(family="Consolas", size=9, weight="bold"),
-            text_color=HUD_THEME["text_dim"], anchor="w"
+        # Кликабельная кнопка в виде компактного текста с уменьшенным шрифтом (size=8)
+        self.lbl_logo_subtitle = ctk.CTkButton(
+            logo_card, text=self.t("app_subtitle").format(version=APP_VERSION), 
+            font=ctk.CTkFont(family="Consolas", size=8, weight="bold"),
+            fg_color="transparent",
+            hover_color=HUD_THEME["chassis_panel"],
+            text_color=HUD_THEME["text_dim"],
+            anchor="w",
+            height=20,
+            command=self.open_about_window
         )
         self.lbl_logo_subtitle.pack(anchor="w", pady=(2, 0))
 
