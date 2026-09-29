@@ -465,8 +465,18 @@ class FoxAssistantApp(ctk.CTk):
 
         avatar_lbl = ctk.CTkLabel(card, text="")
         avatar_lbl.pack(pady=(20, 10))
-        if getattr(self, "fox_avatar_tk", None):
-            avatar_lbl.configure(image=self.fox_avatar_tk)
+        avatar_path = self._resolve_asset_path("avatar_path", "fox_avatar.png")
+        if avatar_path and os.path.exists(avatar_path):
+            try:
+                pil_img = Image.open(avatar_path).convert("RGBA")
+                self.about_avatar_ctk = ctk.CTkImage(
+                    light_image=pil_img, 
+                    dark_image=pil_img, 
+                    size=(185, 185)
+                )
+                avatar_lbl.configure(image=self.about_avatar_ctk)
+            except Exception:
+                avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
         else:
             avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
 
@@ -631,7 +641,6 @@ class FoxAssistantApp(ctk.CTk):
         )
         self.lbl_logo_title.pack(anchor="w")
 
-        # Кликабельная кнопка в виде компактного текста с уменьшенным шрифтом (size=8)
         self.lbl_logo_subtitle = ctk.CTkButton(
             logo_card, text=self.t("app_subtitle").format(version=APP_VERSION), 
             font=ctk.CTkFont(family="Consolas", size=8, weight="bold"),
@@ -1304,7 +1313,8 @@ class FoxAssistantApp(ctk.CTk):
             row_frame, values=act_values, width=240,
             fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
             dropdown_fg_color=HUD_THEME["panel_card"],
-            font=ctk.CTkFont(family="Consolas", size=11), corner_radius=6
+            font=ctk.CTkFont(family="Consolas", size=11), corner_radius=6,
+            state="readonly"  # Запрет на редактирование/стирание текста вручную
         )
         loc_name = self.rev_actions_dict.get(action, act_values[0])
         combo.set(loc_name)
@@ -1444,7 +1454,8 @@ class FoxAssistantApp(ctk.CTk):
             fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
             dropdown_fg_color=HUD_THEME["panel_card"],
             font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
-            command=self.on_language_selected
+            command=self.on_language_selected,
+            state="readonly"  # Запрет на редактирование
         )
         initial_lang_label = "🇷🇺 Русский (RU)" if self.cur_lang == "ru" else "🇬🇧 English (EN)"
         self.combo_lang.set(initial_lang_label)
@@ -1460,7 +1471,8 @@ class FoxAssistantApp(ctk.CTk):
             box, values=mic_display_values, width=400,
             fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
             dropdown_fg_color=HUD_THEME["panel_card"],
-            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            state="readonly"  # Запрет на редактирование
         )
         cur_mic = self.core.config.get("microphone", "")
         if not cur_mic or cur_mic not in mic_display_values:
@@ -1476,7 +1488,8 @@ class FoxAssistantApp(ctk.CTk):
             box, values=list(self.voice_options.keys()), width=400,
             fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
             dropdown_fg_color=HUD_THEME["panel_card"],
-            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            state="readonly"  # Запрет на редактирование
         )
         cur_v = self.core.config.get("tts_voice", "")
         cur_eng = self.core.config.get("tts_engine", "edge-tts")
@@ -1540,7 +1553,8 @@ class FoxAssistantApp(ctk.CTk):
             box, values=list(self.asr_engine_values.keys()), width=400,
             fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
             dropdown_fg_color=HUD_THEME["panel_card"],
-            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            state="readonly"  # Запрет на редактирование
         )
         self._set_engine_combo(self.core.config.get("asr_engine", "auto"))
         self.combo_asr_engine.pack(anchor="w", padx=22, pady=(0, 16))
