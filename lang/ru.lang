@@ -1,7 +1,7 @@
 {
     "app_title": "KITSUNE // LIVING FLAME HUD",
     "app_brand": "🔥 KITSUNE // AI",
-    "app_subtitle": "CYBERPUNK NEON ENGINE // 7.0",
+    "app_subtitle": "CYBERFOX NEON ENGINE // {version}",
     "clock_prefix": "ЛИСЬЕ_ВРЕМЯ",
     "nav_chat": "💬  МОНИТОР ПЛАМЕНИ",
     "nav_editor": "📜  СВИТОК ПОВАДОК",
@@ -105,6 +105,10 @@
     "ui_skills_tag": "🦊 Навыки",
     "ui_mic_tag": "🎙️ Микрофон",
     "ui_voice_tag": "🔊 Голос",
+    "about_window_title": "О лисе",
+    "about_header_text": "Лиса версии",
+    "about_desc_text": "Кибернетический голосовой ассистент с поддержкой двух движков распознавания речи:\n\n• Vosk (CPU): Быстрый локальный офлайн-движок на базе Kaldi (модель {vosk_ver}), обеспечивающий мгновенный отклик без отправки данных в облако.\n\n• Whisper (GPU): Современная нейросетевая модель от OpenAI (версия {whisper_ver}) с ускорением на видеокарте (CUDA) для максимальной точности распознавания.",
+    "about_close_btn": "Закрыть",
     "actions": {
         "get_power_mode": "⚡ Проверить режим питания (get_power_mode)",
         "show_full_window": "🌟 Вылезти на весь экран (show_full_window)",
