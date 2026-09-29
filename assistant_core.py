@@ -59,6 +59,15 @@ MARKER_FILE = os.path.expanduser(r"~\\.sleep_never_marker")
 #: из середины, а короткий шаблон без слота не спорит с шаблоном со слотом.
 SLOT_TOKEN_RE = re.compile(r"\{(\w+)\}")
 
+#: Размер очереди аудио: 100 мс на блок, то есть минута запаса. Очередь нужна,
+#: чтобы пережить долгое распознавание и выполнение сценария (set_volume жмёт
+#: клавиши десятки раз) без потери начала следующей фразы.
+AUDIO_QUEUE_BLOCKS = 600
+
+#: Сколько микрофон молчит после окончания реплики. Эхо в комнате живёт дольше
+#: самой речи, и без этой паузы хвост собственных слов попадает в распознавание.
+MIC_ECHO_TAIL_MS = 350
+
 #: Порог похожести шаблона, выше обычного командного: «включи саус парк» не
 #: должно ловиться шаблоном «саус парк {number}». Подлинность значения слота
 #: проверяется отдельно, поэтому здесь важнее строгость, чем терпимость к ASR.
@@ -115,11 +124,24 @@ def canonical_number(digits):
     return stripped or "0"
 
 
-def parse_slot_number(text):
-    """Разбирает продиктованный номер и возвращает строку цифр или None."""
+def parse_slot_number(text, tolerate_noise=False):
+    """Разбирает продиктованный номер и возвращает строку цифр или None.
+
+    `tolerate_noise` нужен для фраз, пришедших из распознавания: на паузе оно
+    вставляет лишние слова. На записи «включи саус парк, серия 312» Vosk сам
+    добавил «тире» и выдал «включи саус парк тире триста двенадцать». Команда к
+    этому моменту уже опознана по началу фразы, поэтому лишние слова просто
+    выбрасываем: иначе номер теряется и срабатывает команда без слота.
+    """
     tokens = (text or "").split()
     if not tokens:
         return None
+
+    if tolerate_noise:
+        tokens = [t for t in tokens
+                  if t.isdigit() or t in ONE_DIGIT_WORDS or t in RU_NUMBER_VALUES]
+        if not tokens:
+            return None
 
     # Написано цифрами: «312» или «3 1 2».
     if all(token.isdigit() for token in tokens):
@@ -189,10 +211,11 @@ DEFAULT_CONFIG = {
     "asr_chitchat_threshold": 70,
     "asr_chitchat_strong": 75,
     "asr_engine": "auto",
+    "asr_mute_while_speaking": True,
     "whisper_model": "large-v3-turbo",
     "whisper_compute_type": "",
     "whisper_min_vram_mb": 3000,
-    "vad_silence_ms": 700,
+    "vad_silence_ms": 1000,
     "vad_energy_factor": 2.2,
     "vad_max_utterance_s": 12
 }  
@@ -270,8 +293,18 @@ class FoxAssistantCore:
         self.reload_language()  
           
         self.is_listening = False  
-        self.audio_queue = queue.Queue(maxsize=50)  
-          
+        # 100 мс на блок, значит 600 блоков — это минута запаса. Раньше стояло 50
+        # (5 секунд), и при переполнении аудио молча выбрасывалось: пока whisper
+        # распознаёт фразу или set_volume жмёт клавиши, очередь успевала
+        # заполниться, и начало следующей фразы терялось.
+        self.audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_BLOCKS)  
+        self.audio_dropped_blocks = 0  
+        self.audio_drop_reported = 0  
+        # Пока ассистент говорит, микрофон не слушаем (и ещё чуть-чуть после:
+        # комнатное эхо живёт дольше самой реплики). Иначе он распознаёт сам
+        # себя и «слышит» команды, которых никто не говорил.
+        self.mic_resume_at = 0.0  
+        self._unk_warned = False  # чтобы не повторять одну и ту же подсказку  
         self.num_bands = 28  
         self.latest_spectrum = [0.0] * self.num_bands  
         self.band_edges = np.logspace(np.log10(90), np.log10(3800), self.num_bands + 1)  
@@ -344,10 +377,45 @@ class FoxAssistantCore:
                 if intent not in self.all_chitchat_triggers:  
                     self.all_chitchat_triggers[intent] = []  
                 self.all_chitchat_triggers[intent].extend(data.get("triggers", []))  
-                  
+          
+        self._report_command_conflicts()  
         self.rebuild_recognizer()
         return self.commands  
          
+    def _find_duplicate_phrases(self):
+        """Ищет фразы, которые ведут в несколько команд.
+
+        Такие фразы — прямой источник «услышал не ту команду»: срабатывает та
+        команда, которая встретилась раньше в файле, а не та, что имел в виду
+        человек. Например, «включи музыку» была и у Яндекс Музыки, и у
+        play/pause. Возвращает {фраза: [команды]}.
+        """
+        owners = {}
+        for cmd_name, cmd_data in self.commands.items():
+            for phrase in [cmd_name] + cmd_data.get("synonyms", []):
+                norm = self._normalize_text(phrase)
+                if not norm:
+                    continue
+                owners.setdefault(norm, [])
+                if cmd_name not in owners[norm]:
+                    owners[norm].append(cmd_name)
+        return {phrase: names for phrase, names in owners.items() if len(names) > 1}
+
+    def _report_command_conflicts(self):
+        """Предупреждает о конфликтах команд в консоли и в чате HUD."""
+        conflicts = self._find_duplicate_phrases()
+        if not conflicts:
+            return
+        lines = [f"«{phrase}» → {', '.join(names)}" for phrase, names in sorted(conflicts.items())]
+        print("[Команды] Одинаковые фразы у разных команд:")
+        for line in lines:
+            print(f"  - {line}")
+        self.send_to_gui(
+            self.t("ui_skills_tag", "🦊 Навыки"),
+            "Одинаковые фразы у разных команд (сработает первая):\n" + "\n".join(f" • {l}" for l in lines),
+        )
+
+
     # =====================================================================
     # РАСПОЗНАВАНИЕ РЕЧИ: ГРАММАТИКА, НОРМАЛИЗАЦИЯ, ДИАГНОСТИКА
     # =====================================================================
@@ -488,7 +556,7 @@ class FoxAssistantCore:
             device="cuda",
             compute_type=compute,
             language=self.config.get("language", "ru"),
-            silence_ms=self.config.get("vad_silence_ms", 700),
+            silence_ms=self.config.get("vad_silence_ms", 1000),
             energy_factor=self.config.get("vad_energy_factor", 2.2),
             max_utterance_s=self.config.get("vad_max_utterance_s", 12),
             on_log=self._log_asr,
@@ -918,7 +986,11 @@ class FoxAssistantCore:
                 self.audio_queue.get_nowait()  
             except queue.Empty:  
                 break  
-          
+
+        # Прервали — значит и незаконченная фраза больше не нужна.
+        if self.whisper:
+            self.whisper.reset()
+
         if self.recognizer:  
             try:  
                 self.recognizer.Result()  
@@ -931,6 +1003,9 @@ class FoxAssistantCore:
             self.stop_speech_event.clear()
             self.is_speaking = True
             self.current_speaking_text = text
+            # Микрофон закрывается до первой фонемы, а всё, что успело накопиться,
+            # выбрасывается: своя реплика не должна попасть в распознавание.
+            self._flush_audio_input()
 
             pitch_mod = self.config.get("tts_pitch", "+0Hz")
             rate_mod = self.config.get("tts_rate_edge", "+10%")
@@ -1152,13 +1227,49 @@ class FoxAssistantCore:
             self.send_to_gui(self.t("ui_pwr_tag", "⚡ Питание"), str(e))  
          
     def _audio_callback(self, indata, frames, time_info, status):  
+        # Своя речь — не команда. Пока ассистент говорит (и пока не выветрилось
+        # эхо в комнате), микрофон не слушаем: иначе он распознаёт собственную
+        # озвучку и «слышит» то, чего вы не говорили.
+        if self.config.get("asr_mute_while_speaking", True):
+            if self.is_speaking or time.time() < self.mic_resume_at:
+                return
+
         samples = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0  
-        if not self.is_speaking:  
-            self._calc_spectrum(samples, sr=16000)  
+        self._calc_spectrum(samples, sr=16000)  
         try:  
             self.audio_queue.put_nowait(bytes(indata))  
         except queue.Full:  
-            pass  
+            # Не молчим об этом: потерянный блок — это потерянное начало фразы.
+            self.audio_dropped_blocks += 1  
+            if self.audio_dropped_blocks - self.audio_drop_reported >= 100:  
+                self.audio_drop_reported = self.audio_dropped_blocks  
+                self.send_to_gui(  
+                    self.t("ui_mic_tag"),  
+                    f"Пропущено аудио: {self.audio_dropped_blocks} блоков — распознавание не успевает"  
+                )  
+         
+    def _flush_audio_input(self):  
+        """Сбрасывает накопленное аудио перед репликой ассистента.  
+
+        Одного запрета записи мало: к моменту, когда он заговорит, в очереди уже  
+        лежат последние секунды речи, а в VAD whisper — незакрытая фраза. Всё это  
+        иначе распознается как продолжение диалога.  
+        """  
+        if not self.config.get("asr_mute_while_speaking", True):  
+            return  
+        self.mic_resume_at = time.time() + MIC_ECHO_TAIL_MS / 1000.0  
+        while not self.audio_queue.empty():  
+            try:  
+                self.audio_queue.get_nowait()  
+            except queue.Empty:  
+                break  
+        if self.whisper:  
+            self.whisper.reset()  
+        if self.recognizer:  
+            try:  
+                self.recognizer.Result()  
+            except Exception:  
+                pass  
          
     def execute_scenario(self, steps, slots=None):  
         """Выполняет шаги команды, подставляя значения слотов в action value."""
@@ -1345,7 +1456,7 @@ class FoxAssistantCore:
         """
         kind = (spec or {}).get("type", "number")
         if kind == "number":
-            number = parse_slot_number(text)
+            number = parse_slot_number(text, tolerate_noise=True)
             if not number:
                 return None
             lang = self.config.get("language", "ru")
@@ -1637,38 +1748,65 @@ class FoxAssistantCore:
                         data = self.audio_queue.get(timeout=0.1)  
                     except queue.Empty:  
                         continue  
-
-                    if self.asr_engine == "whisper" and self.whisper:
-                        if self.whisper.load_error:
-                            self._fallback_to_vosk(self.whisper.load_error)
-                            continue
-                        heard = self.whisper.feed(data)
-                        if heard:
-                            self.process_recognized_text(heard)
-                        continue
-
-                    if not self.recognizer:  
-                        continue  
-                      
-                    if self.recognizer.AcceptWaveform(data):  
-                        result = json.loads(self.recognizer.Result())  
-                        text = result.get("text", "")  
-                        if text:  
-                            self.process_recognized_text(text)  
-                    else:  
-                        part_json = json.loads(self.recognizer.PartialResult())  
-                        part_text = part_json.get("partial", "").lower()  
-                        if part_text:  
-                            matched_alias, _ = self._extract_wake_and_command(part_text)  
-                            if matched_alias and self.config.get("require_wake_word", True) and not self.is_active_session:  
-                                self.is_active_session = True  
-                                self.last_activation_time = time.time()  
-                                self.set_status(self.t("ui_status_listening"), "#FFD000")  
+                    self._handle_audio_block(data)
                               
         except Exception as e:  
             self.send_to_gui("Audio Error", f"Stream failed: {e}")  
             self.is_listening = False  
-             
+
+    def _handle_audio_block(self, data):
+        """Распознаёт один блок аудио и исполняет законченную фразу.
+
+        Вынесено из `listen_loop` отдельным методом, чтобы это можно было
+        проверить без микрофона: на вход идёт тот же блок, что даёт sounddevice.
+        """
+        if self.asr_engine == "whisper" and self.whisper:
+            if self.whisper.load_error:
+                self._fallback_to_vosk(self.whisper.load_error)
+                return
+            heard = self.whisper.feed(data)
+            if heard:
+                self.process_recognized_text(heard)
+            return
+
+        if not self.recognizer:
+            return
+
+        if self.recognizer.AcceptWaveform(data):
+            text = json.loads(self.recognizer.Result()).get("text", "")
+            if text:
+                self._warn_about_unknown_tokens(text)
+                self.process_recognized_text(text)
+        else:
+            part_text = json.loads(self.recognizer.PartialResult()).get("partial", "").lower()
+            if part_text:
+                matched_alias, _ = self._extract_wake_and_command(part_text)
+                if matched_alias and self.config.get("require_wake_word", True) and not self.is_active_session:
+                    self.is_active_session = True
+                    self.last_activation_time = time.time()
+                    self.set_status(self.t("ui_status_listening"), "#FFD000")
+
+    def _warn_about_unknown_tokens(self, text):
+        """Объясняет, почему в grammar-режиме не работают команды с номером.
+
+        Словарь Vosk — это список готовых фраз, и числительных в нём нет: на
+        записи «серия триста двенадцать» распознаётся как «серия [unk]», а
+        значит команда с номером серии в этом режиме не сработает никогда.
+        Молча терять такое нельзя — человек должен знать, что делать.
+        """
+        if "[unk]" not in text or not self.config.get("asr_grammar", True):
+            return
+        if getattr(self, "_unk_warned", False):
+            return
+        self._unk_warned = True
+        print("[Vosk] [unk] в распознанном тексте: словарь не знает этих слов")
+        self.send_to_gui(
+            self.t("ui_mic_tag"),
+            "Словарь распознавания не знает этих слов — видно по «[unk]». "
+            "Для команд с номером («включи саус парк серия 312») выключи "
+            "asr_grammar в config.json.",
+        )
+
     def start_listening(self):
         has_engine = self.model or (self.asr_engine == "whisper" and self.whisper)
         if not self.is_listening and has_engine:

@@ -38,8 +38,9 @@
     "whisper_model": "large-v3-turbo",
     "whisper_compute_type": "",
     "whisper_min_vram_mb": 3000,
-    "vad_silence_ms": 700,
+    "vad_silence_ms": 1000,
     "vad_energy_factor": 2.2,
     "vad_max_utterance_s": 12,
+    "asr_mute_while_speaking": true,
     "asr_grammar_lang": "ru"
 }

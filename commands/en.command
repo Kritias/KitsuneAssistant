@@ -169,8 +169,7 @@
                 "open youtube",
                 "launch youtube",
                 "watch videos",
-                "video",
-                "youtube"
+                "video"
             ],
             "steps": [
                 {
@@ -398,7 +397,6 @@
         "fox song": {
             "synonyms": [
                 "pause music",
-                "play music",
                 "stop music",
                 "media pause",
                 "toggle music",
@@ -467,8 +465,7 @@
         "play south park episode {number}": {
             "synonyms": [
                 "south park episode {number}",
-                "south park {number}",
-                "play south park episode {number}"
+                "south park {number}"
             ],
             "slots": {
                 "number": {
