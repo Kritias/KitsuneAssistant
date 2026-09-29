@@ -496,6 +496,13 @@ class SileroEngine:
         r"(доллар\w*|рубл\w*|евро|цент\w*|копе\w*|тысяч\w*|миллион\w*|миллиард\w*)",
         re.IGNORECASE,
     )
+    #: Температура и похожие меры: «11 градусов» → «одиннадцать градусов»,
+    #: а не поразрядное «один один градусов».
+    _RE_MEASURE = re.compile(
+        r"(-?\d{1,12})\s+"
+        r"(градус\w*|percent|процент\w*|°C|°|C\b)",
+        re.IGNORECASE,
+    )
 
     def __init__(self, directory: str | None = None, speaker: str = ""):
         import torch
@@ -686,14 +693,32 @@ class SileroEngine:
             # восемнадцать долларов», а не по цифрам.
             return cls._int_to_words(int(match.group(1))) + " " + match.group(2)
 
+        def measure_sub(match):
+            number = int(match.group(1))
+            unit = match.group(2)
+            if number < 0:
+                return f"минус {cls._int_to_words(abs(number))} {unit}"
+            return f"{cls._int_to_words(number)} {unit}"
+
         # Порядок важен: сначала дроби (иначе валютный проход съест «94»
-        # из «6,94 доллара» как целое), затем время и денежные суммы,
+        # из «6,94 доллара» как целое), затем время, меры и денежные суммы,
         # в конце — остатки цифр поразрядно.
         text = cls._RE_DEC.sub(frac_sub, text)
         text = cls._RE_TIME.sub(time_sub, text)
+        text = cls._RE_MEASURE.sub(measure_sub, text)
         text = cls._RE_CURRENCY.sub(currency_sub, text)
         text = cls._RE_DIGITS.sub(digits_sub, text)
         return text
+
+
+def int_to_words(value: int, gender: str = "муж") -> str:
+    """Публичная обёртка: целое число русскими словами для других модулей."""
+    return SileroEngine._int_to_words(int(value), gender)
+
+
+def plural_form(number: int, forms: tuple) -> str:
+    """Публичная обёртка русского согласования: (один, два, пять)."""
+    return SileroEngine._plural_form(int(number), forms)
 
 
 class KokoroEngine:

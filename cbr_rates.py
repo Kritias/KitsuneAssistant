@@ -387,10 +387,62 @@ def resolve_currency(text: str) -> str | None:
     return best
 
 
+def _strip_date_noise(text: str) -> str:
+    """Убирает хвост «года» / «year» и лишние предлоги у даты."""
+    norm = normalize(text)
+    if not norm:
+        return ""
+    # «1 сентября 2026 года», «15 марта г», «March 15 2024 year»
+    norm = re.sub(r"\b(?:года|год|г|year|years)\b", " ", norm)
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm
+
+
+def _parse_spoken_year(words: list[str]) -> int | None:
+    """«две тысячи двадцать шесть» / «2026» → год, иначе None."""
+    if not words:
+        return None
+    if len(words) == 1 and words[0].isdigit() and len(words[0]) in {2, 4}:
+        year = int(words[0])
+        return year + 2000 if year < 100 else year
+
+    joined = " ".join(words)
+    # Типичные голосовые годы рядом с курсами ЦБ.
+    spoken = {
+        "две тысячи двадцать": 2020,
+        "две тысячи двадцать один": 2021,
+        "две тысячи двадцать два": 2022,
+        "две тысячи двадцать три": 2023,
+        "две тысячи двадцать четыре": 2024,
+        "две тысячи двадцать пять": 2025,
+        "две тысячи двадцать шесть": 2026,
+        "две тысячи двадцать семь": 2027,
+        "две тысячи двадцать восемь": 2028,
+        "две тысячи двадцать девять": 2029,
+        "две тысячи тридцать": 2030,
+        "two thousand twenty": 2020,
+        "two thousand twenty one": 2021,
+        "two thousand twenty two": 2022,
+        "two thousand twenty three": 2023,
+        "two thousand twenty four": 2024,
+        "two thousand twenty five": 2025,
+        "two thousand twenty six": 2026,
+        "two thousand twenty seven": 2027,
+        "two thousand twenty eight": 2028,
+        "two thousand twenty nine": 2029,
+        "two thousand thirty": 2030,
+    }
+    # Сначала длинные фразы, чтобы «двадцать шесть» не отрезать от «две тысячи».
+    for phrase, year in sorted(spoken.items(), key=lambda item: -len(item[0])):
+        if phrase in joined:
+            return year
+    return None
+
+
 def parse_date(text: str, today: date | None = None) -> date | None:
     """Разбирает дату: сегодня/вчера, 15.03.2024, «15 марта», «пятнадцатое марта»."""
     today = today or date.today()
-    norm = normalize(text)
+    norm = _strip_date_noise(text)
     if not norm:
         return today
 
@@ -401,6 +453,14 @@ def parse_date(text: str, today: date | None = None) -> date | None:
     if norm in ("позавчера", "day before yesterday"):
         return today - timedelta(days=2)
 
+    # После нормализации точки уже пробелы: «01 09 2026».
+    m = re.fullmatch(r"(\d{1,2})\s+(\d{1,2})\s+(\d{2,4})", norm)
+    if m:
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if year < 100:
+            year += 2000
+        return _safe_date(year, month, day)
+
     m = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", norm)
     if m:
         day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -408,12 +468,13 @@ def parse_date(text: str, today: date | None = None) -> date | None:
             year += 2000
         return _safe_date(year, month, day)
 
-    m = re.fullmatch(r"(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?", norm)
+    m = re.fullmatch(r"(\d{1,2})\s+(\w+)(?:\s+(.+))?", norm)
     if m:
         day = int(m.group(1))
         month = MONTHS_RU.get(m.group(2)) or MONTHS_EN.get(m.group(2))
-        year = int(m.group(3)) if m.group(3) else today.year
-        if month:
+        year_words = (m.group(3) or "").split()
+        year = _parse_spoken_year(year_words) if year_words else today.year
+        if month and year:
             return _safe_date(year, month, day)
 
     # «пятнадцатое марта» / «двадцать первого марта 2024»
@@ -422,13 +483,14 @@ def parse_date(text: str, today: date | None = None) -> date | None:
             rest = norm.replace(ordinal, " ", 1).strip()
             words = rest.split()
             month = None
-            year = today.year
+            year_words = []
             for word in words:
-                if word in MONTHS_RU:
-                    month = MONTHS_RU[word]
-                elif word.isdigit() and len(word) == 4:
-                    year = int(word)
-            if month:
+                if word in MONTHS_RU or word in MONTHS_EN:
+                    month = MONTHS_RU.get(word) or MONTHS_EN.get(word)
+                else:
+                    year_words.append(word)
+            year = _parse_spoken_year(year_words) if year_words else today.year
+            if month and year:
                 return _safe_date(year, month, day)
 
     return None
@@ -442,7 +504,11 @@ def _safe_date(year: int, month: int, day: int) -> date | None:
 
 
 def split_currency_and_date(text: str) -> tuple[str, str]:
-    """Делит хвост слота: «доллара на 15 марта» → («доллара», «15 марта»)."""
+    """Делит хвост слота: «доллара на 15 марта» → («доллара», «15 марта»).
+
+    Если «на» нет, но в конце явно дата («доллара 1 сентября 2026»),
+    откусываем её тоже — иначе курс молча уходит на сегодня.
+    """
     norm = normalize(text)
     if not norm:
         return "", ""
@@ -451,6 +517,16 @@ def split_currency_and_date(text: str) -> tuple[str, str]:
     parts = re.split(r"(?<!\w)(?:на|on|for)(?!\w)", norm, maxsplit=1)
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
+
+    # Без предлога: ищем хвост, который сам разбирается как дата.
+    words = norm.split()
+    for cut in range(1, len(words)):
+        head = " ".join(words[:cut])
+        tail = " ".join(words[cut:])
+        if not resolve_currency(head):
+            continue
+        if parse_date(tail) is not None:
+            return head, tail
     return norm, ""
 
 
@@ -465,6 +541,15 @@ def parse_currency_query(text: str) -> tuple[str | None, date | None]:
         if parsed is None:
             return code, None  # валюта есть, дата битая — отдельный ответ
         return code, parsed
+    # После валюты остались слова, но как дату их не разобрали — не подменяем сегодняшним.
+    leftover = normalize(currency_text)
+    alias = next(
+        (a for a, c in _ALIAS_TO_CODE.items() if c == code and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", leftover)),
+        code.lower(),
+    )
+    rest = re.sub(rf"(?<!\w){re.escape(alias)}(?!\w)", " ", leftover, count=1).strip()
+    if rest:
+        return code, None
     return code, date.today()
 
 

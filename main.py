@@ -246,6 +246,7 @@ class FoxAssistantApp(ctk.CTk):
             act_map.get("screenshot", "screenshot"): "screenshot",
             act_map.get("crypto_rate", "crypto_rate"): "crypto_rate",
             act_map.get("fiat_rate", "fiat_rate"): "fiat_rate",
+            act_map.get("weather", "weather"): "weather",
             act_map.get("set_volume", "set_volume"): "set_volume",
             act_map.get("pause", "pause"): "pause",
             act_map.get("volume_up", "volume_up"): "volume_up",
@@ -701,6 +702,10 @@ class FoxAssistantApp(ctk.CTk):
         self.check_grammar.configure(text=self.t("settings_chk_grammar"))
         self.check_asr_debug.configure(text=self.t("settings_chk_asr_debug"))
         self.lbl_settings_asr_engine.configure(text=self.t("settings_lbl_asr_engine"))
+        if hasattr(self, "lbl_settings_weather"):
+            self.lbl_settings_weather.configure(text=self.t("settings_lbl_weather"))
+            self.lbl_settings_weather_place.configure(text=self.t("settings_lbl_weather_place"))
+            self.lbl_settings_weather_key.configure(text=self.t("settings_lbl_weather_key"))
         
         current_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
         self.asr_engine_values = self._asr_engine_options()
@@ -1580,13 +1585,15 @@ class FoxAssistantApp(ctk.CTk):
         )
         self.lbl_settings_title.pack(anchor="w", pady=(0, 16))
         
-        box = ctk.CTkFrame(
-            self.frame_settings, 
+        settings_shell = ctk.CTkFrame(
+            self.frame_settings,
             fg_color=HUD_THEME["panel_card"],
             border_color=HUD_THEME["panel_border"], border_width=1.5,
             corner_radius=8
         )
-        box.pack(fill="x", padx=2, pady=10)
+        settings_shell.pack(fill="both", expand=True, padx=2, pady=10)
+        box = ctk.CTkScrollableFrame(settings_shell, fg_color="transparent")
+        box.pack(fill="both", expand=True, padx=4, pady=4)
         
         self.check_wake = ctk.CTkCheckBox(
             box, text=self.t("settings_chk_wake"),
@@ -1738,6 +1745,46 @@ class FoxAssistantApp(ctk.CTk):
         self._set_engine_combo(self.core.config.get("asr_engine", "auto"))
         self.combo_asr_engine.pack(anchor="w", padx=22, pady=(0, 16))
 
+        self.lbl_settings_weather = ctk.CTkLabel(box, text=self.t("settings_lbl_weather"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_weather.pack(anchor="w", padx=22, pady=(5, 2))
+        self.weather_provider_labels = {"wttr.in": "wttr", "WeatherAPI.com": "weatherapi"}
+        self.combo_weather = ctk.CTkComboBox(
+            box, values=list(self.weather_provider_labels.keys()), width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            state="readonly"
+        )
+        current_provider = str(self.core.config.get("weather_provider", "weatherapi")).lower()
+        self.combo_weather.set("wttr.in" if current_provider == "wttr" else "WeatherAPI.com")
+        self.combo_weather.pack(anchor="w", padx=22, pady=(0, 12))
+
+        self.lbl_settings_weather_place = ctk.CTkLabel(box, text=self.t("settings_lbl_weather_place"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_weather_place.pack(anchor="w", padx=22, pady=(5, 2))
+        try:
+            import weather as weather_mod
+            place_values = list(weather_mod.PRESET_LOCATIONS)
+        except Exception:
+            place_values = ["Долгопрудный", "Сити", "Москва", "Коломна", "Питер", "Барнаул"]
+        self.combo_weather_place = ctk.CTkComboBox(
+            box, values=place_values, width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        self.combo_weather_place.set(str(self.core.config.get("weather_location") or "Долгопрудный"))
+        self.combo_weather_place.pack(anchor="w", padx=22, pady=(0, 12))
+
+        self.lbl_settings_weather_key = ctk.CTkLabel(box, text=self.t("settings_lbl_weather_key"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_weather_key.pack(anchor="w", padx=22, pady=(5, 2))
+        self.entry_weather_key = ctk.CTkEntry(
+            box, width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        self.entry_weather_key.insert(0, str(self.core.config.get("weatherapi_key") or ""))
+        self.entry_weather_key.pack(anchor="w", padx=22, pady=(0, 16))
+
         self.btn_save_settings = ctk.CTkButton(
             box, text=self.t("settings_btn_save"), 
             fg_color="#FB8500",
@@ -1826,6 +1873,12 @@ class FoxAssistantApp(ctk.CTk):
             self.core.config["wake_timeout"] = float(self.entry_timeout.get())
         except ValueError:
             self.core.config["wake_timeout"] = 7.0
+
+        chosen_weather = self.weather_provider_labels.get(self.combo_weather.get(), "weatherapi")
+        self.core.config["weather_provider"] = chosen_weather
+        chosen_place = self.combo_weather_place.get().strip()
+        self.core.config["weather_location"] = chosen_place or "Долгопрудный"
+        self.core.config["weatherapi_key"] = self.entry_weather_key.get().strip()
         
         self.core.save_config()
         if engine_changed:

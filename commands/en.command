@@ -525,6 +525,41 @@
                     "value": "{currency}|{date_iso}"
                 }
             ]
+        },
+        "weather": {
+            "synonyms": [
+                "what's the weather",
+                "what is the weather",
+                "weather forecast",
+                "current weather"
+            ],
+            "steps": [
+                {
+                    "action": "weather",
+                    "value": ""
+                }
+            ]
+        },
+        "weather {query}": {
+            "synonyms": [
+                "what's the weather {query}",
+                "what is the weather {query}",
+                "weather in {query}",
+                "weather for {query}",
+                "forecast {query}",
+                "forecast for {query}"
+            ],
+            "slots": {
+                "query": {
+                    "type": "weather"
+                }
+            },
+            "steps": [
+                {
+                    "action": "weather",
+                    "value": "{query}"
+                }
+            ]
         }
     },
     "responses": {
@@ -544,7 +579,7 @@
             "I might be a mythical spirit, but even my nine tails couldn't decode that! Try again, human?"
         ],
         "skills_header": "Scroll of Skills ({count}):\n{list}",
-        "skills_speak": "I can guard against sleep, lock buttons from kitty paws, launch music, YouTube, Telegram, cinema and South Park, read out crypto rates and official CBR currency rates for any date, manage volume, take screenshots, and tuck away into the tray. Full scroll printed in the terminal, enjoy, ururu!",
+        "skills_speak": "I can guard against sleep, lock buttons from kitty paws, launch music, YouTube, Telegram, cinema and South Park, read out crypto rates, official CBR currency rates and the weather, manage volume, take screenshots, and tuck away into the tray. Full scroll printed in the terminal, enjoy, ururu!",
         "cat_locked_msg": "Purple shield active! Keyboard asleep, the kitty can nap peacefully!",
         "cat_unlocked_msg": "Kitty shooed away! Keyboard unlocked, ready to type.",
         "pwr_5min_msg": "Mode: Den Snooze (Sleep: 5m | Screen: 5m)",
@@ -563,7 +598,19 @@
         "fiat_line": "Official rate of {name} on {date_spoken}: {rate} {rate_word}. | Checking the CBR: {name} on {date_spoken} was {rate} {rate_word}, yip!",
         "fiat_fail": "Could not fetch the CBR rate: either the network blinked or there is no rate for that date, yip. | No CBR rate came through, ururu. Try again later.",
         "fiat_ask": "Which currency should I check? Dollar, euro, yuan, pound? You can also add a date: dollar rate for yesterday, ururu!",
-        "fiat_bad_date": "Got the currency, but not the date, yip. Say yesterday, March 15, or 15.03.2024."
+        "fiat_bad_date": "Got the currency, but not the date, yip. Say yesterday, March 15, or 15.03.2024.",
+        "weather_now": "Right now {where}: {temp} {temp_word}, {condition}. Feels like {feels} {feels_word}. | {where_cap} right now: {temp} {temp_word} and {condition}, ururu!",
+        "weather_day": "{when_cap} {where}: {tmin} to {tmax} {tmax_word}, {condition}. | Checking {when} {where}: {condition}, {tmin} to {tmax}, yip!",
+        "weather_part": "{when_cap} {where}: about {temp} {temp_word}, {condition}. | {when_cap} {where} — {temp} {temp_word}, {condition}, ururu!",
+        "weather_weekend": "On the weekend {where}: {details} | Weekend {where}. {details}",
+        "weather_horizon": "{provider} cannot see that far: the free forecast is only {days}, counting today, yip. | {provider} only has {days} ahead, and this is beyond that, ururu.",
+        "weather_too_far": "I do not look further than two weeks, ururu. Pick a closer day. | That is past the two-week horizon, yip.",
+        "weather_past": "That date is already gone, yip. I can tell the weather for today and ahead. | I do not chase weather into the past, ururu.",
+        "weather_bad_when": "I did not catch when, ururu. Say today, tomorrow, this evening, or the weekend. | The time slipped past me, yip. Try: weather tomorrow evening in Moscow.",
+        "weather_fail": "I could not fetch the weather: either the network blinked or the service is thinking, yip. | No weather came through, ururu. Try again a bit later.",
+        "weather_unknown_place": "I could not find «{place}», yip. Name the city a bit more clearly. | Where is «{place}»? I did not catch it, ururu.",
+        "weather_no_key": "WeatherAPI has no key in settings, and the backup source is quiet too, yip.",
+        "weather_missing": "That date is missing from the forecast, yip. | The service did not send that day, ururu."
     },
     "chitchat": {
         "praise": {

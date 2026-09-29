@@ -13,6 +13,7 @@ import ctypes
 import tempfile  
 import wave  
 import asyncio  
+from collections import deque
 from datetime import datetime  
 from pathlib import Path  
   
@@ -50,6 +51,18 @@ try:
 except Exception as _cbr_import_error:  # модуль опционален: без него нет «курс валюты»
     cbr_rates = None
     print(f"[CBR] Модуль cbr_rates недоступен: {_cbr_import_error}")
+
+try:
+    import weather
+except Exception as _weather_import_error:  # модуль опционален: без него нет «погода»
+    weather = None
+    print(f"[Weather] Модуль weather недоступен: {_weather_import_error}")
+
+try:
+    import miniaudio
+except Exception as _miniaudio_import_error:  # без него edge-tts ждёт весь mp3
+    miniaudio = None
+    print(f"[TTS] Потоковое воспроизведение недоступно: {_miniaudio_import_error}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -261,7 +274,12 @@ DEFAULT_CONFIG = {
     "whisper_min_vram_mb": 3000,
     "vad_silence_ms": 1000,
     "vad_energy_factor": 2.2,
-    "vad_max_utterance_s": 12
+    "vad_max_utterance_s": 12,
+    # wttr — без ключа; weatherapi — ключ в weatherapi_key. Пустой ключ
+    # не мешает: если выбранный источник молчит, берётся второй.
+    "weather_provider": "weatherapi",
+    "weather_location": "Долгопрудный",
+    "weatherapi_key": "",
 }  
 
 def get_desktop_dir():
@@ -304,6 +322,49 @@ def find_vosk_model_dir(base_folder="model"):
             return root  
     return None  
   
+class _EdgeMp3Feeder(miniaudio.StreamableSource if miniaudio is not None else object):
+    """Отдаёт байты mp3 декодеру по мере поступления.
+
+    Декодер просит крупный кусок (часто 64 КБ). Если ждать ровно столько,
+    воспроизведение начнётся только когда скачается весь ответ. Поэтому
+    отдаём уже пришедшие байты, а пустой ответ — только в конце потока.
+    """
+
+    def __init__(self, stop_event):
+        self._buf = bytearray()
+        self._cv = threading.Condition()
+        self._eof = False
+        self._stop = stop_event
+
+    def write(self, data):
+        if not data:
+            return
+        with self._cv:
+            if self._eof:
+                return
+            self._buf.extend(data)
+            self._cv.notify_all()
+
+    def finish(self):
+        with self._cv:
+            self._eof = True
+            self._cv.notify_all()
+
+    def read(self, num_bytes):
+        with self._cv:
+            while not self._buf and not self._eof:
+                if self._stop.is_set():
+                    self._eof = True
+                    break
+                self._cv.wait(timeout=0.05)
+            take = min(num_bytes, len(self._buf))
+            if take <= 0:
+                return b""
+            chunk = bytes(self._buf[:take])
+            del self._buf[:take]
+            return chunk
+
+
 def load_language_dict(lang_code="ru"):  
     file_path = os.path.join(BASE_DIR, "lang", f"{lang_code}.lang")
     if not os.path.exists(file_path):  
@@ -986,6 +1047,10 @@ class FoxAssistantCore:
         config["wake_word"] = str(config.get("wake_word") or "лисичка")
         config["language"] = str(config.get("language") or "ru")
         config["full_mode"] = bool(config.get("full_mode", False))
+        provider = str(config.get("weather_provider") or "weatherapi").strip().lower()
+        config["weather_provider"] = "wttr" if "wttr" in provider else "weatherapi"
+        config["weather_location"] = str(config.get("weather_location") or "Долгопрудный").strip() or "Долгопрудный"
+        config["weatherapi_key"] = str(config.get("weatherapi_key") or "").strip()
         if not config["full_mode"]:
             # Базовый режим — рамка: ручная правка конфига (whisper, silero)
             # не должна воскрешать тяжёлые движки. Полный режим, наоборот,
@@ -1042,13 +1107,112 @@ class FoxAssistantCore:
          
     async def _async_generate_edge_tts(self, text, voice, pitch="+0Hz", rate="+10%"):  
         communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)  
-        audio_stream = bytearray()  
-        async for chunk in communicate.stream():  
-            if self.stop_speech_event.is_set():  
-                return None  
-            if chunk["type"] == "audio":  
-                audio_stream.extend(chunk["data"])  
-        return bytes(audio_stream)  
+        audio_stream = bytearray()
+        agen = communicate.stream()
+        try:
+            async for chunk in agen:
+                if self.stop_speech_event.is_set():
+                    return None
+                if chunk["type"] == "audio":
+                    audio_stream.extend(chunk["data"])
+        finally:
+            await agen.aclose()
+        return bytes(audio_stream)
+
+    async def _feed_edge_mp3(self, text, voice, pitch, rate, feeder):
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        agen = communicate.stream()
+        try:
+            async for chunk in agen:
+                if self.stop_speech_event.is_set():
+                    break
+                if chunk["type"] == "audio" and chunk.get("data"):
+                    feeder.write(chunk["data"])
+        finally:
+            await agen.aclose()
+
+    def _play_mp3_feeder(self, feeder, sr=24000):
+        """Декодирует mp3 из feeder и играет с первого готового кадра."""
+        pcm_blocks = deque()
+        lock = threading.Lock()
+        state = {"offset": 0, "done": False, "samples": 0}
+        finished = threading.Event()
+
+        def push(samples):
+            arr = np.array(samples, dtype=np.float32, copy=True).reshape(-1)
+            if arr.size == 0:
+                return
+            with lock:
+                pcm_blocks.append(arr)
+                state["samples"] += int(arr.size)
+
+        def pull(frames, out):
+            filled = 0
+            with lock:
+                while filled < frames and pcm_blocks:
+                    block = pcm_blocks[0]
+                    avail = len(block) - state["offset"]
+                    take = min(avail, frames - filled)
+                    out[filled:filled + take] = block[state["offset"]:state["offset"] + take]
+                    state["offset"] += take
+                    filled += take
+                    if state["offset"] >= len(block):
+                        pcm_blocks.popleft()
+                        state["offset"] = 0
+                exhausted = state["done"] and not pcm_blocks
+            return filled, exhausted
+
+        gen = miniaudio.stream_any(
+            feeder,
+            source_format=miniaudio.FileFormat.MP3,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+            sample_rate=sr,
+            frames_to_read=1600,
+        )
+        try:
+            try:
+                while state["samples"] == 0:
+                    push(next(gen))
+            except StopIteration:
+                return False
+
+            def stream_callback(outdata, frames, time_info, status):
+                if self.stop_speech_event.is_set():
+                    outdata.fill(0)
+                    finished.set()
+                    raise sd.CallbackStop
+                filled, exhausted = pull(frames, outdata[:, 0])
+                if filled < frames:
+                    outdata[filled:, 0] = 0.0
+                if filled > 0:
+                    self._calc_spectrum(outdata[:filled, 0], sr=sr)
+                if exhausted:
+                    finished.set()
+                    raise sd.CallbackStop
+
+            with sd.OutputStream(samplerate=sr, channels=1, blocksize=1600, callback=stream_callback) as stream:
+                self.active_output_stream = stream
+                try:
+                    for samples in gen:
+                        if self.stop_speech_event.is_set():
+                            break
+                        push(samples)
+                finally:
+                    with lock:
+                        state["done"] = True
+                while not finished.is_set():
+                    if self.stop_speech_event.is_set():
+                        try:
+                            stream.abort()
+                        except Exception:
+                            pass
+                        break
+                    finished.wait(timeout=0.03)
+                self.active_output_stream = None
+        finally:
+            gen.close()
+        return state["samples"] > 0 and not self.stop_speech_event.is_set()
          
     def _play_audio_array(self, audio_float, sr):  
         cursor = 0  
@@ -1208,17 +1372,50 @@ class FoxAssistantCore:
         self._tts_engine_cache = {}
 
     def _speak_edge(self, text, pitch_mod, rate_mod):
-        """Озвучка через edge-tts. False — нет сети или пришло прерывание."""
+        """Озвучка через edge-tts. False — нет сети или пришло прерывание.
+
+        Поток играет первый кадр mp3, как только его можно декодировать.
+        Если декодера нет, ответ сначала скачивается целиком, как раньше.
+        """
         voice_name = self.config.get("tts_voice", "ru-RU-SvetlanaNeural")
         try:
-            audio_bytes = asyncio.run(
-                self._async_generate_edge_tts(text, voice_name, pitch=pitch_mod, rate=rate_mod)
-            )
+            if miniaudio is not None:
+                return self._speak_edge_streaming(text, voice_name, pitch_mod, rate_mod)
+            return self._speak_edge_buffered(text, voice_name, pitch_mod, rate_mod)
         except Exception as e:
             print(f"[Edge-TTS Fallback]: {e}")
             self.send_to_gui("⚠️ Sound", self.t("ui_network_fallback"))
             return False
 
+    def _speak_edge_streaming(self, text, voice, pitch_mod, rate_mod):
+        feeder = _EdgeMp3Feeder(self.stop_speech_event)
+        result = {"ok": False, "error": None}
+
+        def play():
+            try:
+                result["ok"] = self._play_mp3_feeder(feeder)
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                feeder.finish()
+
+        player = threading.Thread(target=play, daemon=True)
+        player.start()
+        try:
+            asyncio.run(self._feed_edge_mp3(text, voice, pitch_mod, rate_mod, feeder))
+        finally:
+            feeder.finish()
+            player.join()
+        if self.stop_speech_event.is_set():
+            return False
+        if result["error"] is not None and not result["ok"]:
+            raise result["error"]
+        return result["ok"]
+
+    def _speak_edge_buffered(self, text, voice, pitch_mod, rate_mod):
+        audio_bytes = asyncio.run(
+            self._async_generate_edge_tts(text, voice, pitch=pitch_mod, rate=rate_mod)
+        )
         if self.stop_speech_event.is_set():
             return False
         if audio_bytes and len(audio_bytes) > 100:
@@ -1519,6 +1716,8 @@ class FoxAssistantCore:
                     self._report_crypto_rate(val)
                 elif action == "fiat_rate":
                     self._report_fiat_rate(val)
+                elif action == "weather":
+                    self._report_weather(val)
                 elif action == "lock_pc":  
                     ctypes.windll.user32.LockWorkStation()  
                 elif action == "sleep_pc":  
@@ -1639,6 +1838,11 @@ class FoxAssistantCore:
                 "date": day.strftime("%d.%m.%Y"),
                 "date_iso": day.isoformat(),
             }
+        if kind == "weather":
+            text = (text or "").strip()
+            if not text:
+                return None
+            return {"query": text}
         return None
 
     def _split_slot(self, words, prefix, suffix):
@@ -1893,6 +2097,62 @@ class FoxAssistantCore:
             line = f"{parts['name']} на {parts['date_spoken']}: {parts['rate']} {parts['rate_word']}"
         self.send_to_gui(self.t("ui_fiat_tag", "🏦 Курс ЦБ"), line)
         self._speak_variants(line)
+
+    def _report_weather(self, value):
+        """Погода сейчас или на запрошенный срок. Пустое value — сейчас, локация из настроек."""
+        if weather is None:
+            self._speak_variants(self.get_command_response(
+                "weather_fail", "Не смогла достать погоду, похоже, сеть шалит, фырк."
+            ))
+            return
+        query = (value or "").strip()
+        if query == "{query}":
+            query = ""
+        self.set_status(self.t("ui_status_weather", "🦊 Смотрю погоду..."), "#FF8C00")
+        threading.Thread(target=self._weather_worker, args=(query,), daemon=True).start()
+
+    def _weather_worker(self, query):
+        lang = self.config.get("language", "ru")
+        provider = self.config.get("weather_provider", "weatherapi")
+        try:
+            result = weather.answer(
+                query,
+                provider=provider,
+                default_location=self.config.get("weather_location", "Долгопрудный"),
+                api_key=self.config.get("weatherapi_key", ""),
+                lang=lang,
+            )
+        except Exception as exc:
+            print(f"[Weather] {exc}")
+            result = None
+
+        if not result:
+            message = self.get_command_response(
+                "weather_fail", "Не смогла достать погоду, похоже, сеть шалит, фырк."
+            )
+            self.send_to_gui(self.t("ui_weather_tag", "🌤️ Погода"), message)
+            self._speak_variants(message)
+            return
+
+        template = self.get_command_response(result.get("template") or "weather_fail", "")
+        if not template:
+            template = self.get_command_response(
+                "weather_fail", "Не смогла достать погоду, похоже, сеть шалит, фырк."
+            )
+        try:
+            line = template.format(**(result.get("parts") or {}))
+        except (KeyError, IndexError, ValueError):
+            line = template
+        variants = [part.strip() for part in str(line).split("|") if part.strip()]
+        chosen = random.choice(variants) if variants else str(line)
+        title = weather.PROVIDER_TITLE.get(result.get("provider"), "")
+        tag = self.t("ui_weather_tag", "🌤️ Погода")
+        if title:
+            tag = f"{tag} · {title}"
+        if result.get("fallback"):
+            tag = f"{tag} ({self.t('ui_weather_fallback', 'запасной')})"
+        self.send_to_gui(tag, chosen)
+        self.speak(chosen)
 
     def execute_command_or_chat(self, command_text, full_phrase):  
         self.send_to_gui(self.t("ui_user_name"), full_phrase)  
