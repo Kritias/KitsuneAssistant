@@ -64,6 +64,12 @@
     "mic_default": "По умолчанию (System Default)",
     "settings_lbl_voice": "Модуль речевого синтеза (TTS Engine):",
     "settings_lbl_timeout": "Таймаут сессии после имени (сек):",
+    "settings_chk_grammar": "Распознавать только фразы из словаря команд (точнее и в разы быстрее)",
+    "settings_chk_asr_debug": "Показывать в чате сырое распознавание (диагностика)",
+    "settings_lbl_asr_engine": "Движок распознавания:",
+    "asr_engine_auto": "Авто (по железу)",
+    "asr_engine_vosk": "Vosk (CPU)",
+    "asr_engine_whisper": "Whisper (GPU)",
     "settings_lbl_icon": "Пользовательская иконка (.png / .ico):",
     "settings_btn_browse": "ОБЗОР...",
     "settings_btn_save": "🦊 СОХРАНИТЬ В ПАМЯТЬ ЛИСИЦЫ",
@@ -115,6 +121,7 @@
         "volume_mute": "🔇 Выключить звук (volume_mute)",
         "media_play_pause": "⏯️ Плей/Пауза музыки (media_play_pause)",
         "media_next": "⏭️ Следующий трек (media_next)",
+        "media_prev": "⏮️ Предыдущий трек (media_prev)",
         "lock_pc": "🔒 Запереть нору (lock_pc)",
         "sleep_pc": "💤 Спать в норку (sleep_pc)"
     }

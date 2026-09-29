@@ -1,0 +1,270 @@
+"""ASR-бэкенд на faster-whisper (работа через видеокарту).
+
+Vosk распознаёт потоково и отдаёт частичные результаты, а whisper работает
+сегментами. Поэтому здесь своя логика: копим аудио, находим конец фразы по
+тишине (энергетический VAD) и распознаём накопленный фрагмент целиком.
+
+Модуль самодостаточен: `assistant_core` только выбирает движок и дёргает
+`feed()` на каждом блоке аудио.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import numpy as np
+
+SAMPLERATE = 16000
+# Блок аудио приходит по 1600 сэмплов = ровно 100 мс
+FRAME_MS = 100
+# Ниже этой VRAM видеокарта считается слабой, и whisper не включается
+DEFAULT_MIN_VRAM_MB = 3000
+# Абсолютный порог энергии: тише этого считаем тишиной при любом шуме
+ABS_ENERGY_FLOOR = 0.006
+
+# Типовые галлюцинации whisper на тишине и шуме — отбрасываем их
+HALLUCINATIONS = (
+    "продолжение следует",
+    "субтитры", "субтитры сделал", "редактор субтитров", "корректор",
+    "спасибо за просмотр", "подписывайтесь на канал", "ставьте лайк",
+    "thank you for watching", "subscribe",
+)
+
+
+def prepare_cuda_dlls():
+    """Прописывает в PATH библиотеки CUDA из pip-колёс nvidia-*.
+
+    CTranslate2 на Windows ищет cublas64_12.dll и cudnn64_9.dll через PATH,
+    а колёса nvidia-cublas-cu12 / nvidia-cudnn-cu12 кладут их глубоко в
+    site-packages. Без этого шага получаем 'Library cublas64_12.dll is not found'.
+    """
+    if os.name != "nt":
+        return
+    base = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
+    if not os.path.isdir(base):
+        return
+    for root, _dirs, files in os.walk(base):
+        if not any(f.lower().endswith(".dll") for f in files):
+            continue
+        try:
+            os.add_dll_directory(root)
+        except (OSError, AttributeError):
+            pass
+        os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
+
+
+def whisper_available():
+    """Проверяет наличие faster-whisper. Возвращает (ok, причина)."""
+    prepare_cuda_dlls()
+    try:
+        import ctranslate2  # noqa: F401
+        import faster_whisper  # noqa: F401
+    except Exception as e:
+        return False, f"faster-whisper недоступен: {e}"
+    return True, ""
+
+
+def cuda_info():
+    """Информация о CUDA-устройстве или None, если CUDA недоступна."""
+    try:
+        import ctranslate2
+    except Exception:
+        return None
+
+    try:
+        if ctranslate2.get_cuda_device_count() < 1:
+            return None
+    except Exception:
+        return None
+
+    info = {"name": "CUDA GPU", "vram_mb": 0, "compute_types": []}
+    try:
+        info["compute_types"] = list(ctranslate2.get_supported_compute_types("cuda"))
+    except Exception:
+        pass
+
+    # Имя карты и объём памяти берём у nvidia-smi: он есть вместе с драйвером
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            name, vram = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")[:2]]
+            info["name"] = name
+            info["vram_mb"] = int(vram)
+        except Exception:
+            pass
+    return info
+
+
+def choose_compute_type(cuda, preferred="int8_float16"):
+    """Подбирает тип вычислений, поддерживаемый конкретной картой."""
+    supported = (cuda or {}).get("compute_types") or []
+    for candidate in (preferred, "float16", "int8_float32", "int8", "float32"):
+        if not supported or candidate in supported:
+            return candidate
+    return "float32"
+
+
+class WhisperStreamRecognizer:
+    """Потоковое распознавание через whisper с определением конца фразы.
+
+    Модель грузится в отдельном потоке (`load_async`), чтобы не подвешивать
+    интерфейс на время загрузки из кэша HuggingFace.
+    """
+
+    def __init__(self, model_name="large-v3-turbo", device="cuda",
+                 compute_type="int8_float16", language="ru",
+                 silence_ms=700, energy_factor=2.2, max_utterance_s=12.0,
+                 min_speech_ms=300, on_log=None):
+        self.model_name = model_name
+        self.device = device
+        self.compute_type = compute_type
+        self.language = language
+        self.silence_limit_ms = int(silence_ms)
+        self.energy_factor = float(energy_factor)
+        self.max_utterance_ms = int(max_utterance_s * 1000)
+        self.min_speech_ms = int(min_speech_ms)
+        self.on_log = on_log
+
+        self.model = None
+        self.load_error = None
+        self.load_seconds = 0.0
+        self._lock = threading.Lock()
+
+        self._reset_state()
+
+    # ------------------------------------------------------------------ загрузка
+
+    def load_async(self):
+        threading.Thread(target=self.load, daemon=True).start()
+
+    def load(self):
+        """Грузит модель. Исключения запоминаются в `load_error`."""
+        try:
+            prepare_cuda_dlls()
+            from faster_whisper import WhisperModel
+
+            started = time.time()
+            self.model = WhisperModel(
+                self.model_name, device=self.device, compute_type=self.compute_type
+            )
+            self.load_seconds = time.time() - started
+            # Прогреваем граф, чтобы первая реальная фраза не ждала инициализации
+            self.model.transcribe(np.zeros(SAMPLERATE, dtype=np.float32),
+                                  language=self.language, beam_size=1)
+            self._log(f"Whisper «{self.model_name}» загружен за {self.load_seconds:.1f} с "
+                      f"({self.device}/{self.compute_type})")
+        except Exception as e:
+            self.load_error = f"{type(e).__name__}: {e}"
+            self.model = None
+            self._log(f"Загрузка Whisper не удалась: {self.load_error}")
+
+    @property
+    def ready(self):
+        return self.model is not None
+
+    def _log(self, message):
+        if self.on_log:
+            self.on_log(message)
+        else:
+            print(f"[Whisper] {message}")
+
+    # ------------------------------------------------------------------ состояние
+
+    def _reset_state(self):
+        self._frames = []
+        self._speech_ms = 0
+        self._silence_ms = 0
+        self._in_speech = False
+        self._noise_floor = ABS_ENERGY_FLOOR
+
+    def reset(self):
+        with self._lock:
+            self._reset_state()
+
+    # ------------------------------------------------------------------ приём аудио
+
+    def feed(self, pcm_int16_bytes):
+        """Принимает блок аудио. Возвращает текст законченной фразы или None."""
+        if not self.ready:
+            return None
+
+        samples = np.frombuffer(pcm_int16_bytes, dtype=np.int16)
+        if samples.size == 0:
+            return None
+
+        with self._lock:
+            audio = samples.astype(np.float32) / 32768.0
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            threshold = max(self._noise_floor * self.energy_factor, ABS_ENERGY_FLOOR)
+            loud = rms > threshold
+
+            if loud:
+                if not self._in_speech:
+                    self._in_speech = True
+                    self._frames = []
+                self._speech_ms += FRAME_MS
+                self._silence_ms = 0
+                self._frames.append(audio)
+            elif self._in_speech:
+                self._silence_ms += FRAME_MS
+                self._frames.append(audio)
+            else:
+                # Тишина до начала речи — подстраиваем уровень шума под комнату
+                self._noise_floor = 0.9 * self._noise_floor + 0.1 * max(rms, 1e-5)
+                return None
+
+            finished = (self._in_speech and self._silence_ms >= self.silence_limit_ms) \
+                or self._speech_ms >= self.max_utterance_ms
+            if not finished:
+                return None
+
+            frames, speech_ms = self._frames, self._speech_ms
+            self._reset_state()
+
+        if speech_ms < self.min_speech_ms:
+            return None
+        return self._transcribe(np.concatenate(frames))
+
+    # ------------------------------------------------------------------ распознавание
+
+    def _transcribe(self, audio):
+        try:
+            segments, _info = self.model.transcribe(
+                audio,
+                language=self.language,
+                beam_size=1,
+                condition_on_previous_text=False,
+                vad_filter=False,
+                word_timestamps=False,
+            )
+            parts = []
+            for seg in segments:
+                # Отсекаем «фантомные» сегменты, которые whisper выдаёт на шуме
+                if getattr(seg, "no_speech_prob", 0.0) > 0.6 and getattr(seg, "avg_logprob", 0.0) < -1.0:
+                    continue
+                text = seg.text.strip()
+                if text:
+                    parts.append(text)
+        except Exception as e:
+            self._log(f"Ошибка распознавания: {type(e).__name__}: {e}")
+            return None
+
+        text = " ".join(parts).strip()
+        return None if self._is_hallucination(text) else text
+
+    @staticmethod
+    def _is_hallucination(text):
+        if not text:
+            return True
+        low = text.lower().strip(" .,!?…-—")
+        if len(low) < 2:
+            return True
+        return any(marker in low for marker in HALLUCINATIONS)

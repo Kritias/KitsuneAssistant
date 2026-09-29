@@ -12,6 +12,20 @@ import pystray
 from pystray import MenuItem as item
 import numpy as np
 
+# --- Принудительный UTF-8 для консоли ---------------------------------------
+# На Windows консоль часто работает в cp866/cp1252, и любой print() с русским
+# текстом (например, лог загрузки модели Vosk) падает с UnicodeEncodeError.
+# Под pythonw.exe потоки stdout/stderr отсутствуют — проверяем на None.
+if os.name == "nt" and sys.stdout is not None:
+    os.system("chcp 65001 >nul 2>&1")
+
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None:
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
 from assistant_core import FoxAssistantCore, MARKER_FILE, load_language_dict
 
 # --- Киберпанк-палитра KITSUNE ---
@@ -135,6 +149,7 @@ class FoxAssistantApp(ctk.CTk):
         return self.lang.get(key, default if default else key)
 
     def get_available_input_devices(self):
+        """Список устройств ввода: [(индекс, название), ...]."""
         devices = []
         try:
             import sounddevice as sd
@@ -173,6 +188,7 @@ class FoxAssistantApp(ctk.CTk):
             act_map.get("volume_mute", "volume_mute"): "volume_mute",
             act_map.get("media_play_pause", "media_play_pause"): "media_play_pause",
             act_map.get("media_next", "media_next"): "media_next",
+            act_map.get("media_prev", "media_prev"): "media_prev",
             act_map.get("lock_pc", "lock_pc"): "lock_pc",
             act_map.get("sleep_pc", "sleep_pc"): "sleep_pc"
         }
@@ -393,6 +409,15 @@ class FoxAssistantApp(ctk.CTk):
             pass
         os._exit(0)
 
+    def _set_engine_combo(self, engine_value):
+        """Выставляет в списке движок распознавания по его внутреннему значению."""
+        wanted = str(engine_value).lower()
+        for label, value in self.asr_engine_values.items():
+            if value == wanted:
+                self.combo_asr_engine.set(label)
+                return
+        self.combo_asr_engine.set(list(self.asr_engine_values.keys())[0])
+
     def retranslate_ui(self):
         self.title(self.t("app_title"))
         self.lbl_logo_title.configure(text=self.t("app_brand"))
@@ -442,10 +467,22 @@ class FoxAssistantApp(ctk.CTk):
         self.lbl_settings_mic.configure(text=self.t("settings_lbl_mic"))
         self.lbl_settings_voice.configure(text=self.t("settings_lbl_voice"))
         self.lbl_settings_timeout.configure(text=self.t("settings_lbl_timeout"))
+        self.check_grammar.configure(text=self.t("settings_chk_grammar"))
+        self.check_asr_debug.configure(text=self.t("settings_chk_asr_debug"))
+        self.lbl_settings_asr_engine.configure(text=self.t("settings_lbl_asr_engine"))
+        # Подписи движка переводятся, а значения остаются стабильными
+        current_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
+        self.asr_engine_values = {
+            self.t("asr_engine_auto"): "auto",
+            self.t("asr_engine_vosk"): "vosk",
+            self.t("asr_engine_whisper"): "whisper",
+        }
+        self.combo_asr_engine.configure(values=list(self.asr_engine_values.keys()))
+        self._set_engine_combo(current_engine)
         self.btn_save_settings.configure(text=self.t("settings_btn_save"))
 
         self.combo_voice.configure(values=list(self.voice_options.keys()))
-        
+
         input_devices = self.get_available_input_devices()
         mic_display_values = [self.t("mic_default")] + [d[1] for d in input_devices]
         self.combo_mic.configure(values=mic_display_values)
@@ -483,8 +520,8 @@ class FoxAssistantApp(ctk.CTk):
                 self.core.config["tts_rate_edge"] = "+12%"
             else:
                 self.core.config["tts_voice"] = "ru-RU-SvetlanaNeural"
-                self.core.config["tts_pitch"] = "+35Hz"
-                self.core.config["tts_rate_edge"] = "+12%"
+                self.core.config["tts_pitch"] = "+10Hz"
+                self.core.config["tts_rate_edge"] = "+15%"
             self.core.config["tts_engine"] = "edge-tts"
             
             self.core.save_config()
@@ -898,6 +935,10 @@ class FoxAssistantApp(ctk.CTk):
 
         self.after(22, self.animate_hud)
 
+    # =========================================================================
+    # РЕДАКТОР СВИТКА ПОВАДОК (МУЛЬТИ-ШАГОВЫЙ КОНСТРУКТОР)
+    # =========================================================================
+
     def build_editor_screen(self):
         self.frame_editor = ctk.CTkFrame(self.container, fg_color="transparent")
         
@@ -1264,6 +1305,10 @@ class FoxAssistantApp(ctk.CTk):
             self.create_new_command_form()
             self.update_chat("System", self.t("editor_status_deleted").format(name=cmd_to_del))
 
+    # =========================================================================
+    # НАСТРОЙКИ
+    # =========================================================================
+
     def build_settings_screen(self):
         self.frame_settings = ctk.CTkFrame(self.container, fg_color="transparent")
         
@@ -1374,6 +1419,45 @@ class FoxAssistantApp(ctk.CTk):
         self.entry_timeout.insert(0, str(self.core.config.get("wake_timeout", 7.0)))
         self.entry_timeout.pack(anchor="w", padx=22, pady=(0, 16))
 
+        self.check_grammar = ctk.CTkCheckBox(
+            box, text=self.t("settings_chk_grammar"),
+            text_color=HUD_THEME["text_bright"],
+            fg_color="#00F0FF",
+            hover_color="#0E3846",
+            font=ctk.CTkFont(family="Consolas", size=12)
+        )
+        if self.core.config.get("asr_grammar", True):
+            self.check_grammar.select()
+        self.check_grammar.pack(anchor="w", padx=22, pady=(4, 6))
+
+        self.check_asr_debug = ctk.CTkCheckBox(
+            box, text=self.t("settings_chk_asr_debug"),
+            text_color=HUD_THEME["text_bright"],
+            fg_color="#FFB703",
+            hover_color="#D94400",
+            font=ctk.CTkFont(family="Consolas", size=12)
+        )
+        if self.core.config.get("asr_debug", False):
+            self.check_asr_debug.select()
+        self.check_asr_debug.pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.lbl_settings_asr_engine = ctk.CTkLabel(box, text=self.t("settings_lbl_asr_engine"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_asr_engine.pack(anchor="w", padx=22, pady=(5, 2))
+
+        self.asr_engine_values = {
+            self.t("asr_engine_auto"): "auto",
+            self.t("asr_engine_vosk"): "vosk",
+            self.t("asr_engine_whisper"): "whisper",
+        }
+        self.combo_asr_engine = ctk.CTkComboBox(
+            box, values=list(self.asr_engine_values.keys()), width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        self._set_engine_combo(self.core.config.get("asr_engine", "auto"))
+        self.combo_asr_engine.pack(anchor="w", padx=22, pady=(0, 16))
+
         self.btn_save_settings = ctk.CTkButton(
             box, text=self.t("settings_btn_save"), 
             fg_color="#FB8500",
@@ -1422,12 +1506,21 @@ class FoxAssistantApp(ctk.CTk):
         else:
             self.core.config["microphone"] = chosen_mic_label
 
+        self.core.config["asr_grammar"] = bool(self.check_grammar.get())
+        self.core.config["asr_debug"] = bool(self.check_asr_debug.get())
+        selected_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
+        engine_changed = selected_engine != str(self.core.config.get("asr_engine", "auto")).lower()
+        self.core.config["asr_engine"] = selected_engine
+
         try:
             self.core.config["wake_timeout"] = float(self.entry_timeout.get())
         except ValueError:
             self.core.config["wake_timeout"] = 7.0
         
         self.core.save_config()
+        if engine_changed:
+            self.core._init_asr_engine()
+        self.core.rebuild_recognizer()
         self.core.reset_wake_state()
 
     def load_sample_packs(self):

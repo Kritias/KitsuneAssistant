@@ -1,16 +1,27 @@
-# Игнорирование папки с моделью Vosk
+# Виртуальная среда (создаётся лаунчером run.sh / run.bat)
+.venv/
+venv/
+env/
+
+# Модель Vosk: качается отдельно и весит десятки мегабайт
 model/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Локальные артефакты и логи
+.lock
+*.log
+.tmp/
+temp/
 
 # Системные файлы маркеров сна
 .sleep_never_marker
-
-# Кэш Python и временные файлы
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.tmp/
-temp/
 
 # Временные аудиофайлы записи
 *.wav

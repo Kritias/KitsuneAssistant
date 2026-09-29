@@ -4,7 +4,8 @@ import io
 import json  
 import time  
 import queue  
-import random  
+import random
+import re  
 import threading  
 import subprocess  
 import webbrowser  
@@ -22,9 +23,15 @@ import keyboard
 import sounddevice as sd  
 import soundfile as sf  
 import edge_tts  
-from vosk import Model, KaldiRecognizer  
+from vosk import Model, KaldiRecognizer, SetLogLevel  
 from rapidfuzz import fuzz  
 import numpy as np  
+
+try:
+    import asr_whisper
+except Exception as _asr_import_error:  # модуль опционален: без него работает Vosk
+    asr_whisper = None
+    print(f"[ASR] Модуль asr_whisper недоступен: {_asr_import_error}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -47,16 +54,29 @@ DEFAULT_CONFIG = {
     "require_wake_word": True,  
     "wake_timeout": 7.0,  
     "tts_engine": "edge-tts",  
-    "tts_voice": "ru-RU-SvetlanaNeural",  
+    "tts_voice": "ru-RU-SvetlanaNeural",
     "tts_rate": 190,
-    "tts_pitch": "+35Hz",
-    "tts_rate_edge": "+12%",
+    "tts_pitch": "+10Hz",
+    "tts_rate_edge": "+15%",
     "icon_path": "",  
     "avatar_path": "",  
     "icon_sleep_5min": "",  
     "icon_sleep_never": "",  
     "language": "ru",
-    "microphone": ""
+    "microphone": "",
+    "asr_grammar": True,
+    "asr_grammar_extra": [],
+    "asr_debug": False,
+    "asr_cmd_threshold": 70,
+    "asr_chitchat_threshold": 70,
+    "asr_chitchat_strong": 75,
+    "asr_engine": "auto",
+    "whisper_model": "large-v3-turbo",
+    "whisper_compute_type": "",
+    "whisper_min_vram_mb": 3000,
+    "vad_silence_ms": 700,
+    "vad_energy_factor": 2.2,
+    "vad_max_utterance_s": 12
 }  
 
 def get_desktop_dir():
@@ -163,7 +183,9 @@ class FoxAssistantCore:
         else:  
             print(f"[Vosk] Модель загружена: {model_path}")  
             self.model = Model(model_path)  
-            self.recognizer = KaldiRecognizer(self.model, 16000)  
+            self.recognizer = None  
+            self.rebuild_recognizer()  
+        self._init_asr_engine()  
          
     def load_lang_command_file(self, lang_code):  
         os.makedirs(COMMANDS_DIR, exist_ok=True)  
@@ -204,8 +226,208 @@ class FoxAssistantCore:
                     self.all_chitchat_triggers[intent] = []  
                 self.all_chitchat_triggers[intent].extend(data.get("triggers", []))  
                   
+        self.rebuild_recognizer()
         return self.commands  
          
+    # =====================================================================
+    # РАСПОЗНАВАНИЕ РЕЧИ: ГРАММАТИКА, НОРМАЛИЗАЦИЯ, ДИАГНОСТИКА
+    # =====================================================================
+
+    @staticmethod
+    def _normalize_text(text):
+        """Приводит фразу к единому виду — и для grammar-режима Vosk, и для
+        нечёткого сравнения: нижний регистр, ё→е, без пунктуации."""
+        if not isinstance(text, str):
+            return ""
+        text = text.lower().replace("ё", "е")
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _build_grammar_phrases(self):
+        """Собирает словарь активного языка в список фраз для grammar-режима."""
+        lang = self.config.get("asr_grammar_lang", self.config.get("language", "ru"))
+        data = self.command_data_ru if lang == "ru" else self.command_data_en
+
+        phrases = set()
+        for name, cdata in data.get("commands", {}).items():
+            phrases.add(name)
+            phrases.update(cdata.get("synonyms", []))
+        for cdata in data.get("chitchat", {}).values():
+            phrases.update(cdata.get("triggers", []))
+        phrases.add(self.config.get("wake_word", "лисичка"))
+        phrases.update(self.config.get("wake_aliases", []))
+        phrases.update(self.config.get("asr_grammar_extra", []) or [])
+
+        cleaned, seen = [], set()
+        for phrase in phrases:
+            norm = self._normalize_text(phrase)
+            if not norm or norm in seen:
+                continue
+            # Русская модель не знает латиницы — такие фразы Vosk всё равно
+            # отбросит, поэтому не засоряем ими грамматику.
+            if lang == "ru" and not re.search(r"[а-я]", norm):
+                continue
+            seen.add(norm)
+            cleaned.append(norm)
+        return cleaned
+
+    def rebuild_recognizer(self):
+        """Пересоздаёт распознаватель речи.
+
+        В grammar-режиме декодер ограничен словарём команд: на коротких фразах
+        это заметно точнее и в разы быстрее, но всё, что вне словаря, будет
+        подогнано под ближайшую фразу словаря (либо вернётся как '[unk]').
+        """
+        if not getattr(self, "model", None):
+            return
+
+        self.asr_mode = "open"
+        self.asr_phrase_count = 0
+        recognizer = None
+
+        if self.config.get("asr_grammar", True):
+            phrases = self._build_grammar_phrases()
+            # Страховка: если словарь не стыкуется с моделью (например, английские
+            # команды с русской моделью), grammar-режим сделает только хуже.
+            if phrases:
+                cyrillic = sum(1 for p in phrases if re.search(r"[а-я]", p))
+                if cyrillic < len(phrases) * 0.5:
+                    print("[Vosk] Словарь не соответствует модели — grammar-режим отключён")
+                    phrases = []
+            if phrases:
+                grammar = json.dumps(phrases + ["[unk]"], ensure_ascii=False)
+                try:
+                    SetLogLevel(-1)
+                    recognizer = KaldiRecognizer(self.model, 16000, grammar)
+                    self.asr_mode = "grammar"
+                    self.asr_phrase_count = len(phrases)
+                except Exception as e:
+                    print(f"[Vosk Grammar Error]: {e}")
+                finally:
+                    SetLogLevel(0)
+
+        if recognizer is None:
+            recognizer = KaldiRecognizer(self.model, 16000)
+
+        self.recognizer = recognizer
+        print(f"[Vosk] Распознавание: {self.asr_mode}, фраз в грамматике: {self.asr_phrase_count}")
+
+    def _log_asr(self, message):
+        """Единая точка логирования выбора и работы движка распознавания."""
+        print(f"[ASR] {message}")
+        try:
+            self.send_to_gui(self.t("ui_mic_tag"), message)
+        except Exception:
+            pass
+
+    def _init_asr_engine(self):
+        """Выбирает движок распознавания и при нехватке железа откатывается на Vosk.
+
+        Порядок решения: ручной выбор → наличие faster-whisper → наличие CUDA →
+        минимальный объём VRAM. Любой отказ означает работу на Vosk, как раньше.
+        """
+        self.asr_engine = "vosk"
+        self.whisper = None
+        self.whisper_reason = "Vosk (CPU)"
+
+        if asr_whisper is None:
+            self._log_asr("Модуль whisper недоступен, работаю на Vosk (CPU)")
+            return
+
+        want = str(self.config.get("asr_engine", "auto")).lower()
+        if want == "vosk":
+            self._log_asr("Движок задан вручную: Vosk (CPU)")
+            return
+
+        available, reason = asr_whisper.whisper_available()
+        if not available:
+            self._log_asr(f"{reason} — работаю на Vosk (CPU)")
+            return
+
+        cuda = asr_whisper.cuda_info()
+        if not cuda:
+            self._log_asr("CUDA не найдена — работаю на Vosk (CPU)")
+            return
+
+        min_vram = int(self.config.get("whisper_min_vram_mb", 3000))
+        vram = int(cuda.get("vram_mb") or 0)
+        if vram and vram < min_vram:
+            self._log_asr(
+                f"Видеокарта слабая: {cuda.get('name', 'GPU')} {vram} МБ "
+                f"< {min_vram} МБ — работаю на Vosk (CPU)"
+            )
+            return
+
+        compute = self.config.get("whisper_compute_type") or asr_whisper.choose_compute_type(cuda)
+        self.whisper = asr_whisper.WhisperStreamRecognizer(
+            model_name=self.config.get("whisper_model", "large-v3-turbo"),
+            device="cuda",
+            compute_type=compute,
+            language=self.config.get("language", "ru"),
+            silence_ms=self.config.get("vad_silence_ms", 700),
+            energy_factor=self.config.get("vad_energy_factor", 2.2),
+            max_utterance_s=self.config.get("vad_max_utterance_s", 12),
+            on_log=self._log_asr,
+        )
+        self.asr_engine = "whisper"
+        self.whisper_reason = f"Whisper на {cuda.get('name', 'CUDA')} ({compute})"
+        self._log_asr(
+            f"Распознавание на видеокарте: {cuda.get('name', 'CUDA')} "
+            f"{vram} МБ, {compute}, модель {self.whisper.model_name} — гружу в фоне"
+        )
+        self.whisper.load_async()
+
+    def _fallback_to_vosk(self, why):
+        """Аварийный откат на Vosk, если whisper не смог загрузиться."""
+        self._log_asr(f"Whisper не запустился ({why}) — переключаюсь на Vosk (CPU)")
+        self.asr_engine = "vosk"
+        self.whisper = None
+        self.whisper_reason = "Vosk (CPU)"
+
+    def _score_candidates(self, text):
+        """Возвращает (лучшая команда, её счёт, счёт болталок)."""
+        cmd_best, cmd_score = None, 0.0
+        cmd_words = len(text.split())
+        for cmd_name, cmd_data in self.commands.items():
+            for phrase in [cmd_name] + cmd_data.get("synonyms", []):
+                phrase_n = self._normalize_text(phrase)
+                if not phrase_n:
+                    continue
+                score = fuzz.ratio(text, phrase_n)
+                partial = fuzz.partial_ratio(phrase_n, text) if cmd_words >= len(phrase_n.split()) else 0
+                final = max(score, partial)
+                if final > cmd_score:
+                    cmd_score, cmd_best = final, cmd_name
+
+        chat_score = 0.0
+        for triggers in self.all_chitchat_triggers.values():
+            for trigger in triggers:
+                trigger_n = self._normalize_text(trigger)
+                if not trigger_n:
+                    continue
+                score = fuzz.ratio(text, trigger_n)
+                partial = fuzz.partial_ratio(trigger_n, text) if cmd_words >= len(trigger_n.split()) else 0
+                chat_score = max(chat_score, score, partial)
+
+        return cmd_best, cmd_score, chat_score
+
+    def _report_asr_debug(self, text):
+        """Пишет в чат и консоль сырую гипотезу распознавания и лучшие
+        совпадения — чтобы видеть, где именно теряется команда."""
+        norm = self._normalize_text(text)
+        cmd_best, cmd_score, chat_score = self._score_candidates(norm)
+        alias, _ = self._extract_wake_and_command(norm)
+        if getattr(self, "asr_engine", "vosk") == "whisper":
+            mode = "W"
+        elif getattr(self, "asr_mode", "off") == "grammar":
+            mode = "G"
+        else:
+            mode = "O"
+        info = (f'ASR[{mode}] "{text}" | оклик={alias or "—"} | '
+                f'команда={cmd_best or "—"} {cmd_score:.0f} | болталка={chat_score:.0f}')
+        print(f"[Kitsune ASR] {info}")
+        self.send_to_gui("🔎 ASR", info)
+
     def save_command_definition(self, cmd_name, steps, synonyms=None, old_name=None, lang=None):
         if not lang:
             lang = self.config.get("language", "ru")
@@ -273,13 +495,15 @@ class FoxAssistantCore:
                 self.config["tts_rate_edge"] = "+12%"
             elif lang_code == "ru" and cur_voice.startswith("en-"):  
                 self.config["tts_voice"] = "ru-RU-SvetlanaNeural"  
-                self.config["tts_pitch"] = "+35Hz"
-                self.config["tts_rate_edge"] = "+12%"
+                self.config["tts_pitch"] = "+10Hz"
+                self.config["tts_rate_edge"] = "+15%"
             self.save_config()  
          
         cur_lang = self.config.get("language", "ru")  
         self.lang = load_language_dict(cur_lang)  
         self.load_all_commands()  
+        if getattr(self, "whisper", None):  
+            self.whisper.language = cur_lang  
          
     def t(self, key, default=""):  
         return self.lang.get(key, default if default else key)  
@@ -493,8 +717,8 @@ class FoxAssistantCore:
                      
                     t = threading.Thread(target=_render_sapi, daemon=True)  
                     t.start()  
-                    t.join(timeout=10.0)
-  
+                    t.join(timeout=10.0)  
+                     
                     if not self.stop_speech_event.is_set() and os.path.exists(temp_wav) and os.path.getsize(temp_wav) > 44:  
                         with wave.open(temp_wav, "rb") as wf:  
                             sr = wf.getframerate()  
@@ -741,12 +965,12 @@ class FoxAssistantCore:
             self.set_status(free_msg, "#FF8C00")  
          
     def _extract_wake_and_command(self, raw_text):  
-        raw = raw_text.lower().strip()  
+        raw = self._normalize_text(raw_text)  
         if not raw:  
             return None, ""  
           
-        aliases = [self.config.get("wake_word", "лисичка").lower()] + [a.lower() for a in self.config.get("wake_aliases", [])]  
-        aliases = sorted(list(set(aliases)), key=len, reverse=True)  
+        aliases = [self._normalize_text(self.config.get("wake_word", "лисичка"))] + [self._normalize_text(a) for a in self.config.get("wake_aliases", [])]  
+        aliases = sorted((a for a in set(aliases) if a), key=len, reverse=True)  
           
         for alias in aliases:  
             if raw.startswith(alias):  
@@ -774,14 +998,17 @@ class FoxAssistantCore:
          
         for intent, triggers in self.all_chitchat_triggers.items():  
             for trigger in triggers:  
-                score = fuzz.ratio(text, trigger)  
-                partial = fuzz.partial_ratio(trigger, text) if words_count >= len(trigger.split()) else 0  
+                trigger_n = self._normalize_text(trigger)
+                if not trigger_n:
+                    continue
+                score = fuzz.ratio(text, trigger_n)  
+                partial = fuzz.partial_ratio(trigger_n, text) if words_count >= len(trigger_n.split()) else 0  
                 final = max(score, partial)  
                 if final > best_score:  
                     best_score = final  
                     matched_intent = intent  
          
-        if best_score >= 70 and matched_intent:  
+        if best_score >= float(self.config.get("asr_chitchat_threshold", 70)) and matched_intent:  
             if matched_intent == "capabilities":  
                 return "CAPABILITIES_TRIGGER", best_score  
               
@@ -797,6 +1024,7 @@ class FoxAssistantCore:
          
     def execute_command_or_chat(self, command_text, full_phrase):  
         self.send_to_gui(self.t("ui_user_name"), full_phrase)  
+        command_text = self._normalize_text(command_text)  
           
         chitchat_reply, chitchat_score = self._match_chitchat(command_text)  
           
@@ -807,10 +1035,10 @@ class FoxAssistantCore:
         for cmd_name, cmd_data in self.commands.items():  
             phrases = [cmd_name] + cmd_data.get("synonyms", [])  
             for phrase in phrases:  
-                phrase_words_count = len(phrase.split())  
-                score = fuzz.ratio(command_text, phrase)  
+                phrase_words_count = len(self._normalize_text(phrase).split())  
+                score = fuzz.ratio(command_text, self._normalize_text(phrase))  
                 if cmd_words_count >= phrase_words_count:  
-                    partial = fuzz.partial_ratio(phrase, command_text)  
+                    partial = fuzz.partial_ratio(self._normalize_text(phrase), command_text)  
                 else:  
                     partial = 0  
                   
@@ -819,7 +1047,7 @@ class FoxAssistantCore:
                     best_cmd_score = final_score  
                     best_cmd = cmd_name  
           
-        if chitchat_score >= 75 and chitchat_score >= best_cmd_score:  
+        if chitchat_score >= float(self.config.get("asr_chitchat_strong", 75)) and chitchat_score >= best_cmd_score:  
             if chitchat_reply == "CAPABILITIES_TRIGGER":  
                 self.report_capabilities()  
             elif chitchat_reply:  
@@ -827,11 +1055,11 @@ class FoxAssistantCore:
                 self.reset_wake_state()  
             return  
           
-        if best_cmd_score >= 70 and best_cmd:  
+        if best_cmd_score >= float(self.config.get("asr_cmd_threshold", 70)) and best_cmd:  
             self.execute_scenario(self.commands[best_cmd].get("steps", []))  
             return  
           
-        if chitchat_score >= 70 and chitchat_reply:  
+        if chitchat_score >= float(self.config.get("asr_chitchat_threshold", 70)) and chitchat_reply:  
             if chitchat_reply == "CAPABILITIES_TRIGGER":  
                 self.report_capabilities()  
             else:  
@@ -844,9 +1072,12 @@ class FoxAssistantCore:
         self.reset_wake_state()  
          
     def process_recognized_text(self, text):  
-        raw_text = text.lower().strip()  
+        raw_text = self._normalize_text(text)  
         if not raw_text:  
             return  
+
+        if self.config.get("asr_debug", False):
+            self._report_asr_debug(text)
           
         matched_alias, command_text = self._extract_wake_and_command(raw_text)  
         require_wake = self.config.get("require_wake_word", True)  
@@ -895,7 +1126,7 @@ class FoxAssistantCore:
 
         try:  
             device_info = sd.query_devices(kind='input' if not mic_device else mic_device)  
-            dev_name = device_info.get('name', 'Unknown') if isinstance(device_info, dict) else mic_device
+            dev_name = device_info.get('name', 'Unknown') if isinstance(device_info, dict) else mic_device  
             con_msg = self.t("ui_mic_connected").format(device=dev_name)  
             self.send_to_gui(self.t("ui_mic_tag"), con_msg)  
         except Exception as e:  
@@ -916,6 +1147,15 @@ class FoxAssistantCore:
                         data = self.audio_queue.get(timeout=0.1)  
                     except queue.Empty:  
                         continue  
+
+                    if self.asr_engine == "whisper" and self.whisper:
+                        if self.whisper.load_error:
+                            self._fallback_to_vosk(self.whisper.load_error)
+                            continue
+                        heard = self.whisper.feed(data)
+                        if heard:
+                            self.process_recognized_text(heard)
+                        continue
 
                     if not self.recognizer:  
                         continue  
@@ -939,12 +1179,17 @@ class FoxAssistantCore:
             self.send_to_gui("Audio Error", f"Stream failed: {e}")  
             self.is_listening = False  
              
-    def start_listening(self):  
-        if not self.is_listening and self.model:  
+    def start_listening(self):
+        has_engine = self.model or (self.asr_engine == "whisper" and self.whisper)
+        if not self.is_listening and has_engine:
+            if getattr(self, "whisper_reason", ""):
+                self.send_to_gui(self.t("ui_mic_tag"), f"Распознавание: {self.whisper_reason}")
             threading.Thread(target=self.listen_loop, daemon=True).start()  
              
-    def stop_listening(self):  
-        self.is_listening = False  
-        self.interrupt_speech()  
+    def stop_listening(self):
+        self.is_listening = False
+        self.interrupt_speech()
+        if self.whisper:
+            self.whisper.reset()
         self.set_status(self.t("ui_status_asleep"), "#8A798C")  
         self.send_to_gui(self.t("ui_mic_tag"), self.t("ui_mic_disconnected"))
