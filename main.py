@@ -212,6 +212,7 @@ class FoxAssistantApp(ctk.CTk):
             act_map.get("type_text", "type_text"): "type_text",
             act_map.get("run_cmd", "run_cmd"): "run_cmd",
             act_map.get("screenshot", "screenshot"): "screenshot",
+            act_map.get("crypto_rate", "crypto_rate"): "crypto_rate",
             act_map.get("set_volume", "set_volume"): "set_volume",
             act_map.get("pause", "pause"): "pause",
             act_map.get("volume_up", "volume_up"): "volume_up",
@@ -234,6 +235,9 @@ class FoxAssistantApp(ctk.CTk):
             }
         else:
             self.voice_options = {
+                self.t("voice_ru_auto"): ("auto", "", "+0Hz", "+0%"),
+                self.t("voice_ru_silero"): ("silero", "baya", "+0Hz", "+0%"),
+                self.t("voice_ru_kokoro"): ("kokoro", "sveta", "+0Hz", "+0%"),
                 self.t("voice_ru_kitsune"): ("edge-tts", "ru-RU-SvetlanaNeural", "+10Hz", "+15%"),
                 self.t("voice_ru_kawaii"): ("edge-tts", "ru-RU-SvetlanaNeural", "+75Hz", "+35%"),
                 self.t("voice_ru_svetlana"): ("edge-tts", "ru-RU-SvetlanaNeural", "-10Hz", "-5%"),
@@ -582,22 +586,37 @@ class FoxAssistantApp(ctk.CTk):
             self.combo_mic.set(mic_display_values[0])
         else:
             self.combo_mic.set(cur_mic)
-        
-        cur_v = self.core.config.get("tts_voice", "")
-        cur_eng = self.core.config.get("tts_engine", "edge-tts")
-        cur_pitch = self.core.config.get("tts_pitch", "+0Hz")
-        
-        selected_voice_display = list(self.voice_options.keys())[0]
-        for k, v in self.voice_options.items():
-            if v[0] == cur_eng:
-                if v[0] == "pyttsx3":
-                    selected_voice_display = k
-                    break
-                if v[1] == cur_v and v[2] == cur_pitch:
-                    selected_voice_display = k
-                    break
-        self.combo_voice.set(selected_voice_display)
+
+        self.combo_voice.set(self._voice_display_for_config())
         self.refresh_editor_command_list()
+
+    def _voice_display_for_config(self):
+        """Подпись в списке голосов, соответствующая текущему конфигу.
+
+        Локальные движки хранят голос в своих ключах (silero_speaker,
+        kokoro_voice), поэтому сверять их с tts_voice нельзя — иначе после
+        сохранения настроек выбор «съезжал» на первый пункт списка.
+        """
+        engine = str(self.core.config.get("tts_engine", "auto")).lower()
+        per_engine = {
+            "silero": self.core.config.get("silero_speaker", ""),
+            "kokoro": self.core.config.get("kokoro_voice", ""),
+        }
+
+        for label, values in self.voice_options.items():
+            option_engine, voice_name = values[0], values[1]
+            if option_engine != engine:
+                continue
+            if engine in ("auto", "pyttsx3", "silero", "kokoro"):
+                # Голос у этих движков один в рамках пункта списка либо берётся
+                # из отдельного ключа; дополнительное сравнение не нужно.
+                if engine not in per_engine or per_engine[engine] == voice_name:
+                    return label
+                continue
+            if voice_name == self.core.config.get("tts_voice", ""):
+                return label
+
+        return list(self.voice_options.keys())[0]
 
     def on_language_selected(self, selected_label):
         new_lang = LANG_OPTIONS.get(selected_label, "ru")
@@ -1491,21 +1510,7 @@ class FoxAssistantApp(ctk.CTk):
             font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
             state="readonly"  # Запрет на редактирование
         )
-        cur_v = self.core.config.get("tts_voice", "")
-        cur_eng = self.core.config.get("tts_engine", "edge-tts")
-        cur_pitch = self.core.config.get("tts_pitch", "+0Hz")
-        
-        selected_voice_display = list(self.voice_options.keys())[0]
-        for k, v in self.voice_options.items():
-            if v[0] == cur_eng:
-                if v[0] == "pyttsx3":
-                    selected_voice_display = k
-                    break
-                if v[1] == cur_v and v[2] == cur_pitch:
-                    selected_voice_display = k
-                    break
-                    
-        self.combo_voice.set(selected_voice_display)
+        self.combo_voice.set(self._voice_display_for_config())
         self.combo_voice.pack(anchor="w", padx=22, pady=(0, 16))
         
         self.lbl_settings_timeout = ctk.CTkLabel(box, text=self.t("settings_lbl_timeout"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
@@ -1593,12 +1598,23 @@ class FoxAssistantApp(ctk.CTk):
         self.core.config["language"] = new_lang
 
         choice = self.combo_voice.get()
+        tts_engine_changed = False
         if choice in self.voice_options:
             engine_type, voice_name, pitch_mod, rate_mod = self.voice_options[choice]
+            tts_engine_changed = engine_type != str(self.core.config.get("tts_engine", "auto")).lower()
             self.core.config["tts_engine"] = engine_type
-            self.core.config["tts_voice"] = voice_name
-            self.core.config["tts_pitch"] = pitch_mod
-            self.core.config["tts_rate_edge"] = rate_mod
+            if engine_type == "edge-tts":
+                # Голос, питч и темп задаются только у сетевого движка.
+                # У локальных свои настройки, а tts_voice остаётся резервом:
+                # если модель не поднялась, реплику озвучит привычный edge-голос,
+                # а не SAPI с пустым именем голоса.
+                self.core.config["tts_voice"] = voice_name
+                self.core.config["tts_pitch"] = pitch_mod
+                self.core.config["tts_rate_edge"] = rate_mod
+            elif engine_type == "silero":
+                self.core.config["silero_speaker"] = voice_name
+            elif engine_type == "kokoro":
+                self.core.config["kokoro_voice"] = voice_name
 
         chosen_mic_label = self.combo_mic.get()
         default_mic_text = self.t("mic_default")
@@ -1621,6 +1637,8 @@ class FoxAssistantApp(ctk.CTk):
         self.core.save_config()
         if engine_changed:
             self.core._init_asr_engine()
+        if tts_engine_changed:
+            self.core._init_tts_engine()
         self.core.rebuild_recognizer()
         self.core.reset_wake_state()
 

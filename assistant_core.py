@@ -33,11 +33,144 @@ except Exception as _asr_import_error:  # модуль опционален: б�
     asr_whisper = None
     print(f"[ASR] Модуль asr_whisper недоступен: {_asr_import_error}")
 
+try:
+    import tts_local
+except Exception as _tts_import_error:  # модуль опционален: без него edge-tts и SAPI
+    tts_local = None
+    print(f"[TTS] Модуль tts_local недоступен: {_tts_import_error}")
+
+try:
+    import crypto_rates
+except Exception as _rates_import_error:  # модуль опционален: без него нет команд «курс ...»
+    crypto_rates = None
+    print(f"[Rates] Модуль crypto_rates недоступен: {_rates_import_error}")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COMMANDS_DIR = os.path.join(BASE_DIR, "commands")
 MARKER_FILE = os.path.expanduser(r"~\\.sleep_never_marker")  
-  
+
+# =====================================================================
+# СЛОТЫ КОМАНД: «включи саус парк серия 312», «курс биткоина»
+# =====================================================================
+
+#: Именованная дырка в шаблоне команды, например "включи саус парк серия {number}".
+#: Слот всегда стоит в хвосте фразы — так его значение не надо выковыривать
+#: из середины, а короткий шаблон без слота не спорит с шаблоном со слотом.
+SLOT_TOKEN_RE = re.compile(r"\{(\w+)\}")
+
+#: Размер очереди аудио: 100 мс на блок, то есть минута запаса. Очередь нужна,
+#: чтобы пережить долгое распознавание и выполнение сценария (set_volume жмёт
+#: клавиши десятки раз) без потери начала следующей фразы.
+AUDIO_QUEUE_BLOCKS = 600
+
+#: Сколько микрофон молчит после окончания реплики. Эхо в комнате живёт дольше
+#: самой речи, и без этой паузы хвост собственных слов попадает в распознавание.
+MIC_ECHO_TAIL_MS = 350
+
+#: Порог похожести шаблона, выше обычного командного: «включи саус парк» не
+#: должно ловиться шаблоном «саус парк {number}». Подлинность значения слота
+#: проверяется отдельно, поэтому здесь важнее строгость, чем терпимость к ASR.
+SLOT_PREFIX_THRESHOLD = 76
+
+#: Слова-цифры и числительные: пользователь может продиктовать код серии
+#: цифрами («312»), по одной цифре («три один два») или числом
+#: («сто двенадцать»). Английские формы нужны для en.command.
+ONE_DIGIT_WORDS = {
+    "ноль": "0", "нуль": "0", "zero": "0", "oh": "0",
+    "один": "1", "одна": "1", "одно": "1", "one": "1",
+    "два": "2", "две": "2", "two": "2",
+    "три": "3", "three": "3",
+    "четыре": "4", "four": "4",
+    "пять": "5", "five": "5",
+    "шесть": "6", "six": "6",
+    "семь": "7", "seven": "7",
+    "восемь": "8", "eight": "8",
+    "девять": "9", "nine": "9",
+}
+
+#: Числительные целиком — собираются сложением разрядов: «сто двадцать три».
+RU_NUMBER_VALUES = {
+    "ноль": 0, "нуль": 0, "один": 1, "одна": 1, "одно": 1, "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8,
+    "девять": 9, "десять": 10, "одиннадцать": 11, "двенадцать": 12,
+    "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16,
+    "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20,
+    "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60,
+    "семьдесят": 70, "восемьдесят": 80, "девяносто": 90, "сто": 100,
+    "двести": 200, "триста": 300, "четыреста": 400, "пятьсот": 500,
+    "шестьсот": 600, "семьсот": 700, "восемьсот": 800, "девятьсот": 900,
+    "тысяча": 1000, "тысячи": 1000, "тысяч": 1000,
+}
+
+#: Как номер проговаривается по цифрам — требование к команде серии.
+RU_SPOKEN_DIGITS = (
+    "ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь",
+    "восемь", "девять",
+)
+EN_SPOKEN_DIGITS = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine",
+)
+
+
+def canonical_number(digits):
+    """Убирает ведущие нули.
+
+    Сайт сериалов отдаёт /episode/101/, а /episode/0101/ и /episode/1/ — 404,
+    поэтому «ноль один ноль один» должно превратиться в 101, а не в 101 или 0101.
+    """
+    stripped = (digits or "").lstrip("0")
+    return stripped or "0"
+
+
+def parse_slot_number(text, tolerate_noise=False):
+    """Разбирает продиктованный номер и возвращает строку цифр или None.
+
+    `tolerate_noise` нужен для фраз, пришедших из распознавания: на паузе оно
+    вставляет лишние слова. На записи «включи саус парк, серия 312» Vosk сам
+    добавил «тире» и выдал «включи саус парк тире триста двенадцать». Команда к
+    этому моменту уже опознана по началу фразы, поэтому лишние слова просто
+    выбрасываем: иначе номер теряется и срабатывает команда без слота.
+    """
+    tokens = (text or "").split()
+    if not tokens:
+        return None
+
+    if tolerate_noise:
+        tokens = [t for t in tokens
+                  if t.isdigit() or t in ONE_DIGIT_WORDS or t in RU_NUMBER_VALUES]
+        if not tokens:
+            return None
+
+    # Написано цифрами: «312» или «3 1 2».
+    if all(token.isdigit() for token in tokens):
+        return canonical_number("".join(tokens))
+
+    # Продиктовано по одной цифре: «три один два», «ноль один ноль один».
+    if all(token in ONE_DIGIT_WORDS for token in tokens):
+        return canonical_number("".join(ONE_DIGIT_WORDS[token] for token in tokens))
+
+    # Числительное: «сто двенадцать».
+    total, current = 0, 0
+    for token in tokens:
+        value = RU_NUMBER_VALUES.get(token)
+        if value is None:
+            return None
+        if value >= 1000:
+            total += (current or 1) * 1000
+            current = 0
+        else:
+            current += value
+    return canonical_number(str(total + current))
+
+
+def spoken_digits(digits, lang="ru"):
+    """Проговаривает номер по одной цифре: «312» → «три один два»."""
+    words = RU_SPOKEN_DIGITS if lang == "ru" else EN_SPOKEN_DIGITS
+    return " ".join(words[int(ch)] for ch in str(digits) if ch.isdigit())
+
+
 DEFAULT_CONFIG = {  
     "wake_word": "лисичка",  
     "wake_aliases": [  
@@ -53,11 +186,18 @@ DEFAULT_CONFIG = {
     ],  
     "require_wake_word": True,  
     "wake_timeout": 7.0,  
-    "tts_engine": "edge-tts",  
+    # auto: сначала локальный синтез (Silero/kokoro), затем edge-tts и SAPI.
+    "tts_engine": "auto",  
     "tts_voice": "ru-RU-SvetlanaNeural",
     "tts_rate": 190,
     "tts_pitch": "+10Hz",
     "tts_rate_edge": "+15%",
+    "tts_models_dir": "tts_models",
+    "silero_speaker": "",
+    "kokoro_voice": "sveta",
+    # true — лёгкая q8-модель kokoro (138 МБ) вместо fp32 (326 МБ): меньше диск,
+    # но на CPU примерно вчетверо медленнее.
+    "kokoro_prefer_quantized": False,
     "icon_path": "",  
     "avatar_path": "",  
     "icon_sleep_5min": "",  
@@ -71,10 +211,11 @@ DEFAULT_CONFIG = {
     "asr_chitchat_threshold": 70,
     "asr_chitchat_strong": 75,
     "asr_engine": "auto",
+    "asr_mute_while_speaking": True,
     "whisper_model": "large-v3-turbo",
     "whisper_compute_type": "",
     "whisper_min_vram_mb": 3000,
-    "vad_silence_ms": 700,
+    "vad_silence_ms": 1000,
     "vad_energy_factor": 2.2,
     "vad_max_utterance_s": 12
 }  
@@ -138,7 +279,7 @@ class FoxAssistantCore:
         self.sleep_change_callback = sleep_change_callback  
         self.window_action = window_action_callback  
           
-        self.config = self.load_config()  
+        self.config = self._coerce_config_types(self.load_config())  
         self.lang = {}  
         self.all_chitchat_triggers = {}  
           
@@ -152,8 +293,18 @@ class FoxAssistantCore:
         self.reload_language()  
           
         self.is_listening = False  
-        self.audio_queue = queue.Queue(maxsize=50)  
-          
+        # 100 мс на блок, значит 600 блоков — это минута запаса. Раньше стояло 50
+        # (5 секунд), и при переполнении аудио молча выбрасывалось: пока whisper
+        # распознаёт фразу или set_volume жмёт клавиши, очередь успевала
+        # заполниться, и начало следующей фразы терялось.
+        self.audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_BLOCKS)  
+        self.audio_dropped_blocks = 0  
+        self.audio_drop_reported = 0  
+        # Пока ассистент говорит, микрофон не слушаем (и ещё чуть-чуть после:
+        # комнатное эхо живёт дольше самой реплики). Иначе он распознаёт сам
+        # себя и «слышит» команды, которых никто не говорил.
+        self.mic_resume_at = 0.0  
+        self._unk_warned = False  # чтобы не повторять одну и ту же подсказку  
         self.num_bands = 28  
         self.latest_spectrum = [0.0] * self.num_bands  
         self.band_edges = np.logspace(np.log10(90), np.log10(3800), self.num_bands + 1)  
@@ -186,6 +337,7 @@ class FoxAssistantCore:
             self.recognizer = None  
             self.rebuild_recognizer()  
         self._init_asr_engine()  
+        self._init_tts_engine()  
          
     def load_lang_command_file(self, lang_code):  
         os.makedirs(COMMANDS_DIR, exist_ok=True)  
@@ -225,10 +377,46 @@ class FoxAssistantCore:
                 if intent not in self.all_chitchat_triggers:  
                     self.all_chitchat_triggers[intent] = []  
                 self.all_chitchat_triggers[intent].extend(data.get("triggers", []))  
-                  
+          
+        self._report_command_conflicts()  
         self.rebuild_recognizer()
         return self.commands  
          
+    def _find_duplicate_phrases(self):
+        """Ищет фразы, которые ведут в несколько команд.
+
+        Такие фразы — прямой источник «услышал не ту команду»: срабатывает та
+        команда, которая встретилась раньше в файле, а не та, что имел в виду
+        человек. Например, «включи музыку» была и у Яндекс Музыки, и у
+        play/pause. Возвращает {фраза: [команды]}.
+        """
+        owners = {}
+        for cmd_name, cmd_data in self.commands.items():
+            for phrase in [cmd_name] + cmd_data.get("synonyms", []):
+                norm = self._normalize_text(phrase)
+                if not norm:
+                    continue
+                owners.setdefault(norm, [])
+                if cmd_name not in owners[norm]:
+                    owners[norm].append(cmd_name)
+        return {phrase: names for phrase, names in owners.items() if len(names) > 1}
+
+    def _report_command_conflicts(self):
+        """Предупреждает о конфликтах команд в консоли и в чате HUD."""
+        conflicts = self._find_duplicate_phrases()
+        if not conflicts:
+            return
+        lines = [f"«{phrase}» → {', '.join(names)}" for phrase, names in sorted(conflicts.items())]
+        print("[Команды] Одинаковые фразы у разных команд:")
+        for line in lines:
+            print(f"  - {line}")
+        self.send_to_gui(
+            self.t("ui_skills_tag", "🦊 Навыки"),
+            self.t("warn_conflict_header", "Одинаковые фразы у разных команд (сработает первая):")
+            + "\n" + "\n".join(f" • {l}" for l in lines),
+        )
+
+
     # =====================================================================
     # РАСПОЗНАВАНИЕ РЕЧИ: ГРАММАТИКА, НОРМАЛИЗАЦИЯ, ДИАГНОСТИКА
     # =====================================================================
@@ -262,6 +450,11 @@ class FoxAssistantCore:
         for phrase in phrases:
             norm = self._normalize_text(phrase)
             if not norm or norm in seen:
+                continue
+            # Шаблоны со слотами в грамматику не годятся: Vosk — это список
+            # готовых фраз, «серия {number}» с любым номером туда не вписать, а
+            # нормализация превратила бы {number} в лишнее слово «number».
+            if SLOT_TOKEN_RE.search(phrase):
                 continue
             # Русская модель не знает латиницы — такие фразы Vosk всё равно
             # отбросит, поэтому не засоряем ими грамматику.
@@ -364,7 +557,7 @@ class FoxAssistantCore:
             device="cuda",
             compute_type=compute,
             language=self.config.get("language", "ru"),
-            silence_ms=self.config.get("vad_silence_ms", 700),
+            silence_ms=self.config.get("vad_silence_ms", 1000),
             energy_factor=self.config.get("vad_energy_factor", 2.2),
             max_utterance_s=self.config.get("vad_max_utterance_s", 12),
             on_log=self._log_asr,
@@ -383,6 +576,164 @@ class FoxAssistantCore:
         self.asr_engine = "vosk"
         self.whisper = None
         self.whisper_reason = "Vosk (CPU)"
+
+    def _log_tts(self, message):
+        """Единая точка логирования выбора и работы движка синтеза."""
+        print(f"[TTS] {message}")
+        try:
+            self.send_to_gui(self.t("ui_voice_tag"), message)
+        except Exception:
+            pass
+
+    def tts_models_dir(self):
+        """Каталог локальных моделей синтеза из конфига."""
+        if tts_local is None:
+            return ""
+        return tts_local.models_dir(self.config.get("tts_models_dir"))
+
+    def _init_tts_engine(self):
+        """Перенастраивает локальный синтез речи в фоне.
+
+        Выбор движка требует импорта torch (чтобы понять, жива ли CUDA), а это
+        секунды на Windows. Держать из-за этого окно приложения нельзя, поэтому
+        сброс состояния делается сразу, а сама проба уходит в отдельный поток:
+        пока он работает, озвучка идёт через edge-tts.
+        """
+        self.tts_local_name = ""
+        self.tts_local_engine = None
+        self._tts_engine_cache = {}
+        self._tts_voice_fingerprint = self._local_voice_fingerprint()
+
+        # Токен нужен, чтобы настройки, сохранённые дважды подряд, не гоняли
+        # две настройки параллельно: побеждает последняя, ранняя выходит.
+        self._tts_setup_token = getattr(self, "_tts_setup_token", 0) + 1
+        token = self._tts_setup_token
+        threading.Thread(target=self._select_tts_engine, args=(token,), daemon=True).start()
+
+    def _tts_setup_is_current(self, token):
+        return token == self._tts_setup_token
+
+    def _select_tts_engine(self, token):
+        """Основной поток: ручной выбор → Silero (torch + CUDA) → kokoro (ONNX).
+
+        Если недоступно ничего, озвучка остаётся сетевой: edge-tts, затем SAPI5.
+        """
+        if tts_local is None:
+            self._log_tts("Модуль локального синтеза недоступен — работаю через edge-tts")
+            return
+
+        name, reason = tts_local.choose_engine(self.config, self.tts_models_dir())
+        if not self._tts_setup_is_current(token):
+            return
+
+        # Модели, которых ещё нет, догружаем в фоне даже когда говорить прямо
+        # сейчас может другой движок. Иначе на машине с CUDA Silero не появился
+        # бы никогда: kokoro уже готов, и выбор всегда останавливался бы на нём.
+        pending = tts_local.downloadable_engines(self.config, self.tts_models_dir())
+
+        if name:
+            self.tts_local_name = name
+            self._log_tts(f"Локальный синтез: {name} — гружу модель в фоне")
+            threading.Thread(
+                target=self._preload_tts_engine, args=(name, token), daemon=True
+            ).start()
+        elif not pending:
+            self._log_tts(f"Локальный синтез недоступен ({reason}) — работаю через edge-tts")
+            return
+
+        if pending:
+            self._log_tts(f"Догружаю модели в фоне: {', '.join(pending)}")
+            threading.Thread(
+                target=self._prepare_tts_models, args=(pending, token), daemon=True
+            ).start()
+
+    def _prepare_tts_models(self, engines, token):
+        """Разовая загрузка моделей. Любой сбой просто оставляет edge-tts."""
+        loaded = False
+        try:
+            if "silero" in engines:
+                loaded = tts_local.download_silero(
+                    self.tts_models_dir(), progress=self._log_tts
+                ) or loaded
+            if "kokoro" in engines:
+                loaded = tts_local.download_kokoro(
+                    self.tts_models_dir(),
+                    progress=self._log_tts,
+                    prefer_quantized=bool(self.config.get("kokoro_prefer_quantized", False)),
+                ) or loaded
+        except Exception as exc:
+            self._log_tts(f"Загрузка моделей не удалась: {exc}")
+
+        if not self._tts_setup_is_current(token):
+            return
+
+        if loaded:
+            self._select_tts_engine(token)
+        else:
+            self._log_tts("Модели загрузить не удалось — озвучка через edge-tts")
+
+    def _preload_tts_engine(self, name, token):
+        """Загружает модель в фоне, чтобы не задерживать появление окна."""
+        engine = self._local_engine(name, token)
+        if not self._tts_setup_is_current(token):
+            return
+        if engine is None:
+            self._log_tts(f"{name} не запустился — перехожу на edge-tts")
+            self.tts_local_name = ""
+            return
+        device = getattr(engine, "device_name", "") or "CPU"
+        voice = getattr(engine, "speaker", "") or getattr(engine, "voice", "")
+        self._log_tts(f"Локальный синтез готов: {name}, {device}, голос {voice or 'по умолчанию'}")
+
+    def _local_engine(self, name, token=None):
+        """Ленивое создание движка с кэшированием, включая неудачные попытки."""
+        if tts_local is None:
+            return None
+        if name not in self._tts_engine_cache:
+            engine = tts_local.create_engine(name, self.config, self.tts_models_dir())
+            if token is not None and not self._tts_setup_is_current(token):
+                # Настройки успели смениться, пока модель поднималась. Возвращать
+                # движок нельзя, и класть его в уже очищенный кэш тоже: иначе
+                # старая озвучка воскреснет в новом наборе настроек.
+                return None
+            self._tts_engine_cache[name] = engine
+        return self._tts_engine_cache[name]
+
+    def _tts_engine_order(self):
+        """Очередь движков: локальный → edge-tts → SAPI5.
+
+        Пока модель грузится в фоне, локальный движок вернёт None, и озвучка
+        сразу уйдёт на edge-tts, а после загрузки начнёт работать локально.
+        """
+        want = str(self.config.get("tts_engine", "auto")).lower()
+        if want == "pyttsx3":
+            return ["pyttsx3"]
+        if want == "edge-tts":
+            return ["edge-tts", "pyttsx3"]
+
+        if want == "silero":
+            order = ["silero", "kokoro"]
+        elif want == "kokoro":
+            order = ["kokoro", "silero"]
+        elif self.tts_local_name:
+            order = [self.tts_local_name]
+            order.append("kokoro" if self.tts_local_name == "silero" else "silero")
+        else:
+            order = []
+        return order + ["edge-tts", "pyttsx3"]
+
+    def _local_voice_fingerprint(self):
+        """Настройки, от которых зависит голос локального движка.
+
+        Движок кэшируется вместе с голосом, поэтому смена этих настроек должна
+        ронять кэш — иначе переключение Света↔Маша в настройках жило бы до
+        перезапуска приложения.
+        """
+        return (
+            str(self.config.get("silero_speaker", "")),
+            str(self.config.get("kokoro_voice", "")),
+            bool(self.config.get("kokoro_prefer_quantized", False)),
+        )
 
     def _score_candidates(self, text):
         """Возвращает (лучшая команда, её счёт, счёт болталок)."""
@@ -437,10 +788,13 @@ class FoxAssistantCore:
         if old_name and old_name in target_cmds and old_name != cmd_name:
             del target_cmds[old_name]
 
-        target_cmds[cmd_name] = {
-            "synonyms": synonyms if synonyms is not None else [],
-            "steps": steps
-        }
+        # Переносим прочие поля прежнего определения: у команд со слотами
+        # («включи саус парк серия {number}») есть секция slots, и редактор HUD
+        # не должен терять её при сохранении.
+        entry = dict(target_cmds.get(cmd_name) or {})
+        entry["synonyms"] = synonyms if synonyms is not None else []
+        entry["steps"] = steps
+        target_cmds[cmd_name] = entry
         self.save_lang_command_file(lang, target_data)
         self.load_all_commands()
 
@@ -526,17 +880,65 @@ class FoxAssistantCore:
             print(f"[Voice Detection Error]: {e}")  
          
     def load_config(self):  
+        defaults = DEFAULT_CONFIG.copy()
         if os.path.exists(CONFIG_FILE):  
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:  
-                data = json.load(f)  
-                merged = DEFAULT_CONFIG.copy()  
-                merged.update(data)  
-                return merged  
-        return DEFAULT_CONFIG.copy()  
-         
+            try:  
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:  
+                    data = json.load(f)
+            except Exception as e:
+                # Битый конфиг (обрыв записи, чужая правка) не должен ронять
+                # приложение целиком: работаем на умолчаниях и говорим об этом.
+                print(f"[Config] Не читается, использую умолчания: {e}")
+                return defaults
+            if isinstance(data, dict):
+                defaults.update(data)
+            return defaults
+        return defaults  
+
+    @staticmethod
+    def _coerce_config_types(config):
+        """Приводит поля конфига к ожидаемым типам.
+
+        config.json открыт для ручной правки, и строка в числовом поле или
+        None вместо списка сейчас падает уже в рантайме (float("7"), len(None))
+        в местах, далёких от причины. Молча исправляем то, что исправимо.
+        """
+        def _number(key, default, cast=float):
+            try:
+                config[key] = cast(config.get(key))
+            except (TypeError, ValueError):
+                print(f"[Config] {key}: неверное значение {config.get(key)!r}, ставлю {default}")
+                config[key] = default
+
+        _number("wake_timeout", 7.0)
+        _number("asr_cmd_threshold", 70)
+        _number("asr_chitchat_threshold", 70)
+        _number("asr_chitchat_strong", 75)
+        _number("whisper_min_vram_mb", 3000, int)
+        _number("vad_silence_ms", 1000, int)
+        _number("vad_max_utterance_s", 12)
+        if not isinstance(config.get("asr_grammar_extra"), list):
+            config["asr_grammar_extra"] = []
+        if not isinstance(config.get("wake_aliases"), list):
+            config["wake_aliases"] = []
+        config["wake_word"] = str(config.get("wake_word") or "лисичка")
+        config["language"] = str(config.get("language") or "ru")
+        return config
+
     def save_config(self):  
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:  
-            json.dump(self.config, f, ensure_ascii=False, indent=4)  
+        # Запись через временный файл: прерванная прямая запись оставляла бы
+        # битый config.json, который при следующем старте уже не прочитать.
+        tmp = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:  
+                json.dump(self.config, f, ensure_ascii=False, indent=4)
+            os.replace(tmp, CONFIG_FILE)
+        except Exception as e:
+            print(f"[Config] Не удалось сохранить: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
          
     def send_to_gui(self, sender, text):  
         if self.update_gui:  
@@ -647,102 +1049,169 @@ class FoxAssistantCore:
                 self.audio_queue.get_nowait()  
             except queue.Empty:  
                 break  
-          
+
+        # Прервали — значит и незаконченная фраза больше не нужна.
+        if self.whisper:
+            self.whisper.reset()
+
         if self.recognizer:  
             try:  
                 self.recognizer.Result()  
             except Exception:  
                 pass  
          
-    def _tts_worker_loop(self):  
-        while True:  
-            text = self.tts_queue.get()  
-            self.stop_speech_event.clear()  
-            self.is_speaking = True  
-            self.current_speaking_text = text  
-             
-            played_successfully = False  
-            tts_engine_type = self.config.get("tts_engine", "edge-tts")  
-            voice_name = self.config.get("tts_voice", "ru-RU-SvetlanaNeural")  
+    def _tts_worker_loop(self):
+        while True:
+            text = self.tts_queue.get()
+            self.stop_speech_event.clear()
+            self.is_speaking = True
+            self.current_speaking_text = text
+            # Микрофон закрывается до первой фонемы, а всё, что успело накопиться,
+            # выбрасывается: своя реплика не должна попасть в распознавание.
+            self._flush_audio_input()
+
             pitch_mod = self.config.get("tts_pitch", "+0Hz")
             rate_mod = self.config.get("tts_rate_edge", "+10%")
-             
-            if self.stop_speech_event.is_set():  
-                self.is_speaking = False  
-                self.tts_queue.task_done()  
-                continue  
-             
-            if tts_engine_type == "edge-tts":  
-                try:  
-                    audio_bytes = asyncio.run(self._async_generate_edge_tts(text, voice_name, pitch=pitch_mod, rate=rate_mod))  
-                    if self.stop_speech_event.is_set():  
-                        self.is_speaking = False  
-                        self.tts_queue.task_done()  
-                        continue  
-                      
-                    if audio_bytes and len(audio_bytes) > 100:  
-                        with io.BytesIO(audio_bytes) as bio:  
-                            data, sr = sf.read(bio, dtype="float32")  
-                            if data.ndim > 1:  
-                                data = data[:, 0]  
-                            self._play_audio_array(data, sr)  
-                            played_successfully = True  
-                except Exception as e:  
-                    print(f"[Edge-TTS Fallback]: {e}")  
-                    self.send_to_gui("⚠️ Sound", self.t("ui_network_fallback"))  
-             
-            if not played_successfully and not self.stop_speech_event.is_set():  
-                temp_wav = os.path.join(tempfile.gettempdir(), f"fox_{os.getpid()}_{int(time.time()*1000)}.wav")  
-                try:  
-                    def _render_sapi():  
-                        try:  
-                            ctypes.windll.ole32.CoInitialize(None)  
-                            engine = pyttsx3.init()  
-                            engine.setProperty("rate", self.config.get("tts_rate", 190))  
-                            engine.setProperty("volume", 1.0)  
-                              
-                            lang = self.config.get("language", "ru")  
-                            chosen_sapi = self.sapi_voices.get(lang) or self.sapi_voices.get("ru") or self.sapi_voices.get("en")  
-                            if chosen_sapi:  
-                                engine.setProperty("voice", chosen_sapi)  
-                              
-                            engine.save_to_file(text, temp_wav)  
-                            engine.runAndWait()  
-                            engine.stop()  
-                        finally:  
-                            try:  
-                                ctypes.windll.ole32.CoUninitialize()  
-                            except Exception:  
-                                pass  
-                     
-                    t = threading.Thread(target=_render_sapi, daemon=True)  
-                    t.start()  
-                    t.join(timeout=10.0)  
-                     
-                    if not self.stop_speech_event.is_set() and os.path.exists(temp_wav) and os.path.getsize(temp_wav) > 44:  
-                        with wave.open(temp_wav, "rb") as wf:  
-                            sr = wf.getframerate()  
-                            ch = wf.getnchannels()  
-                            raw = wf.readframes(wf.getnframes())  
-                          
-                        arr = np.frombuffer(raw, dtype=np.int16)  
-                        if ch > 1:  
-                            arr = arr.reshape(-1, ch)[:, 0]  
-                        data = arr.astype(np.float32) / 32768.0  
-                        self._play_audio_array(data, sr)  
-                        try:  
-                            os.remove(temp_wav)  
-                        except Exception:  
-                            pass  
-                except Exception as err:  
-                    print(f"[SAPI5 Error]: {err}")  
-             
-            self.latest_spectrum = [0.0] * self.num_bands  
-            self.current_speaking_text = ""  
-            time.sleep(0.05)  
-            self.is_speaking = False  
-            self.tts_queue.task_done()  
-         
+            played_successfully = False
+
+            for engine_name in self._tts_engine_order():
+                if self.stop_speech_event.is_set():
+                    break
+                try:
+                    if engine_name in ("silero", "kokoro"):
+                        played_successfully = self._speak_local(engine_name, text)
+                    elif engine_name == "edge-tts":
+                        played_successfully = self._speak_edge(text, pitch_mod, rate_mod)
+                    elif engine_name == "pyttsx3":
+                        played_successfully = self._speak_sapi(text)
+                except Exception as err:
+                    print(f"[TTS {engine_name}]: {err}")
+                    played_successfully = False
+                if played_successfully:
+                    break
+
+            self.latest_spectrum = [0.0] * self.num_bands
+            self.current_speaking_text = ""
+            time.sleep(0.05)
+            self.is_speaking = False
+            self._apply_echo_tail()
+            self.tts_queue.task_done()
+
+    def _apply_echo_tail(self):
+        """Держит микрофон закрытым ещё MIC_ECHO_TAIL_MS после конца реплики.
+
+        Хвост эха считается от КОНЦА реплики, а не от начала: раньше метка
+        ставилась до синтеза, и у любой фразы длиннее хвоста микрофон
+        открывался ещё звучащим эхом — ассистент слышал собственные слова.
+        """
+        if self.config.get("asr_mute_while_speaking", True):
+            self.mic_resume_at = time.time() + MIC_ECHO_TAIL_MS / 1000.0
+
+    def _speak_local(self, engine_name, text):
+        """Локальный синтез (Silero или kokoro).
+
+        Берём только уже загруженный движок: пока модель качается или
+        поднимается в фоне, реплику лучше озвучить через edge-tts, чем
+        задерживать ответ.
+        """
+        self._sync_local_voice()
+        engine = self._tts_engine_cache.get(engine_name)
+        if engine is None:
+            return False
+        audio, sr = engine.synthesize(text)
+        if self.stop_speech_event.is_set() or audio is None or len(audio) == 0:
+            return False
+        # Громкость выравнивается по пику: движки отдают её очень по-разному,
+        # и без этого смена голоса слышалась бы как скачок громкости.
+        audio = tts_local.normalize_peak(audio)
+        self._play_audio_array(np.asarray(audio, dtype="float32"), int(sr))
+        return True
+
+    def _sync_local_voice(self):
+        """Роняет кэш движков, если в настройках сменился голос.
+
+        Полная реинициализация при смене голоса — слишком дорого (перезагрузка
+        модели), а менять голос без пересоздания движок не умеет. Дешевле
+        сравнить «отпечаток» настроек и пересоздать только затронутый движок.
+        """
+        if self._local_voice_fingerprint() == getattr(self, "_tts_voice_fingerprint", None):
+            return
+        self._tts_voice_fingerprint = self._local_voice_fingerprint()
+        self._tts_engine_cache = {}
+
+    def _speak_edge(self, text, pitch_mod, rate_mod):
+        """Озвучка через edge-tts. False — нет сети или пришло прерывание."""
+        voice_name = self.config.get("tts_voice", "ru-RU-SvetlanaNeural")
+        try:
+            audio_bytes = asyncio.run(
+                self._async_generate_edge_tts(text, voice_name, pitch=pitch_mod, rate=rate_mod)
+            )
+        except Exception as e:
+            print(f"[Edge-TTS Fallback]: {e}")
+            self.send_to_gui("⚠️ Sound", self.t("ui_network_fallback"))
+            return False
+
+        if self.stop_speech_event.is_set():
+            return False
+        if audio_bytes and len(audio_bytes) > 100:
+            with io.BytesIO(audio_bytes) as bio:
+                data, sr = sf.read(bio, dtype="float32")
+                if data.ndim > 1:
+                    data = data[:, 0]
+                self._play_audio_array(data, sr)
+                return True
+        return False
+
+    def _speak_sapi(self, text):
+        """Последний фолбэк: системный голос Windows через SAPI5."""
+        temp_wav = os.path.join(tempfile.gettempdir(), f"fox_{os.getpid()}_{int(time.time()*1000)}.wav")
+
+        def _render_sapi():
+            try:
+                ctypes.windll.ole32.CoInitialize(None)
+                engine = pyttsx3.init()
+                engine.setProperty("rate", self.config.get("tts_rate", 190))
+                engine.setProperty("volume", 1.0)
+
+                lang = self.config.get("language", "ru")
+                chosen_sapi = self.sapi_voices.get(lang) or self.sapi_voices.get("ru") or self.sapi_voices.get("en")
+                if chosen_sapi:
+                    engine.setProperty("voice", chosen_sapi)
+
+                engine.save_to_file(text, temp_wav)
+                engine.runAndWait()
+                engine.stop()
+            finally:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+        try:
+            t = threading.Thread(target=_render_sapi, daemon=True)
+            t.start()
+            t.join(timeout=10.0)
+
+            if not self.stop_speech_event.is_set() and os.path.exists(temp_wav) and os.path.getsize(temp_wav) > 44:
+                with wave.open(temp_wav, "rb") as wf:
+                    sr = wf.getframerate()
+                    ch = wf.getnchannels()
+                    raw = wf.readframes(wf.getnframes())
+
+                arr = np.frombuffer(raw, dtype=np.int16)
+                if ch > 1:
+                    arr = arr.reshape(-1, ch)[:, 0]
+                data = arr.astype(np.float32) / 32768.0
+                self._play_audio_array(data, sr)
+                try:
+                    os.remove(temp_wav)
+                except Exception:
+                    pass
+                return True
+        except Exception as err:
+            print(f"[SAPI5 Error]: {err}")
+        return False
+
     def speak(self, text):  
         speaker_label = self.t("ui_speaker_name", "🦊 Лисичка")  
         self.send_to_gui(speaker_label, text)  
@@ -845,19 +1314,58 @@ class FoxAssistantCore:
             self.send_to_gui(self.t("ui_pwr_tag", "⚡ Питание"), str(e))  
          
     def _audio_callback(self, indata, frames, time_info, status):  
+        # Своя речь — не команда. Пока ассистент говорит (и пока не выветрилось
+        # эхо в комнате), микрофон не слушаем: иначе он распознаёт собственную
+        # озвучку и «слышит» то, чего вы не говорили.
+        if self.config.get("asr_mute_while_speaking", True):
+            if self.is_speaking or time.time() < self.mic_resume_at:
+                return
+
         samples = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0  
-        if not self.is_speaking:  
-            self._calc_spectrum(samples, sr=16000)  
+        self._calc_spectrum(samples, sr=16000)  
         try:  
             self.audio_queue.put_nowait(bytes(indata))  
         except queue.Full:  
-            pass  
+            # Не молчим об этом: потерянный блок — это потерянное начало фразы.
+            self.audio_dropped_blocks += 1  
+            if self.audio_dropped_blocks - self.audio_drop_reported >= 100:  
+                self.audio_drop_reported = self.audio_dropped_blocks  
+                self.send_to_gui(  
+                    self.t("ui_mic_tag"),  
+                    self.t("warn_audio_dropped", "Пропущено аудио: {count} блоков — распознавание не успевает").format(count=self.audio_dropped_blocks),
+                )  
          
-    def execute_scenario(self, steps):  
+    def _flush_audio_input(self):  
+        """Сбрасывает накопленное аудио перед репликой ассистента.  
+
+        Одного запрета записи мало: к моменту, когда он заговорит, в очереди уже  
+        лежат последние секунды речи, а в VAD whisper — незакрытая фраза. Всё это  
+        иначе распознается как продолжение диалога.  
+        """  
+        if not self.config.get("asr_mute_while_speaking", True):  
+            return  
+        # Пока is_speaking=True, колбэк микрофона молчит сам; точное время
+        # открытия после реплики ставит _tts_worker_loop, когда звук закончился.
+        while not self.audio_queue.empty():  
+            try:  
+                self.audio_queue.get_nowait()  
+            except queue.Empty:  
+                break  
+        if self.whisper:  
+            self.whisper.reset()  
+        if self.recognizer:  
+            try:  
+                self.recognizer.Result()  
+            except Exception:  
+                pass  
+         
+    def execute_scenario(self, steps, slots=None):  
+        """Выполняет шаги команды, подставляя значения слотов в action value."""
+        substitutions = dict(slots or {})
         self.set_status(self.t("ui_status_conjuring"), "#FF8C00")  
         for step in steps:  
             action = step.get("action")  
-            val = step.get("value", "")  
+            val = self._fill_slots(step.get("value", ""), substitutions)  
             try:  
                 if action == "speak":  
                     if "|" in val:
@@ -939,6 +1447,8 @@ class FoxAssistantCore:
                     pyautogui.screenshot(str(filename))  
                     msg = self.get_command_response("screenshot_msg", "Снимок экрана сохранен: {filename}").format(filename=filename.name)  
                     self.send_to_gui(self.t("ui_screenshot_tag", "🐾 След"), msg)  
+                elif action == "crypto_rate":  
+                    self._report_crypto_rate(val)
                 elif action == "lock_pc":  
                     ctypes.windll.user32.LockWorkStation()  
                 elif action == "sleep_pc":  
@@ -1022,30 +1532,199 @@ class FoxAssistantCore:
          
         return None, best_score  
          
+    # -----------------------------------------------------------------
+    # Команды со слотами: «включи саус парк серия 312», «курс биткоина»
+    # -----------------------------------------------------------------
+
+    def _parse_slot(self, name, spec, text):
+        """Превращает хвост фразы в подстановки для шагов команды.
+
+        Возвращает словарь вроде {"number": "312", "digits": "три один два"}
+        или None, если хвост на значение слота не похож.
+        """
+        kind = (spec or {}).get("type", "number")
+        if kind == "number":
+            number = parse_slot_number(text, tolerate_noise=True)
+            if not number:
+                return None
+            lang = self.config.get("language", "ru")
+            return {"number": number, "digits": spoken_digits(number, lang)}
+        if kind == "coin":
+            ticker = crypto_rates.resolve_coin(text) if crypto_rates else None
+            if not ticker:
+                return None
+            return {"coin": ticker}
+        return None
+
+    def _split_slot(self, words, prefix, suffix):
+        """Ищет шаблон во фразе и возвращает (хвост, счёт) или (None, 0).
+
+        Шаблон сравнивается скользящим окном в несколько слов, и окно может
+        стоять не в самом начале: «включи саус парк 312» должно разобрать как
+        шаблон «саус парк» плюс номер. Значение слота — всегда конец фразы,
+        поэтому за окном должно остаться хоть одно слово.
+        """
+        prefix_words = prefix.split()
+        if not prefix_words:
+            return None, 0
+        base = len(prefix_words)
+        best = None  # (счёт, индекс конца шаблона)
+        for size in (base, base + 1, base - 1):
+            if size < 1:
+                continue
+            for start in range(0, len(words) - size + 1):
+                if start + size >= len(words):
+                    continue  # за шаблоном должно остаться значение слота
+                score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
+                if best is None or score > best[0]:
+                    best = (score, start + size)
+        if best is None or best[0] < SLOT_PREFIX_THRESHOLD:
+            return None, 0
+
+        tail = words[best[1]:]
+        suffix_words = suffix.split()
+        if suffix_words:
+            if len(tail) <= len(suffix_words):
+                return None, 0
+            literal = " ".join(tail[-len(suffix_words):])
+            suffix_score = fuzz.ratio(literal, suffix)
+            if suffix_score < SLOT_PREFIX_THRESHOLD:
+                return None, 0
+            tail = tail[:-len(suffix_words)]
+            # Итоговый скор учитывает обе литеральные части шаблона.
+            best = ((best[0] + suffix_score) / 2, best[1])
+        tail_text = " ".join(tail).strip()
+        return (tail_text or None), best[0]
+
+    def _match_slot_command(self, command_text):
+        """Ищет команду-шаблон со слотом. Возвращает (имя команды, подстановки).
+
+        Общий нечёткий перебор тут не годится: фраза с номером серии не совпадёт
+        целиком ни с одной фразой словаря, зато её перетянет короткая команда без
+        номера («включи саус парк»). Поэтому шаблоны со слотами разбираются
+        отдельно и раньше общего перебора.
+        """
+        words = (command_text or "").split()
+        if not words:
+            return None, {}
+
+        best = None  # (счёт, имя команды, подстановки)
+        for cmd_name, cmd_data in self.commands.items():
+            slots = cmd_data.get("slots") or {}
+            if not slots:
+                continue
+            for phrase in [cmd_name] + cmd_data.get("synonyms", []):
+                match = SLOT_TOKEN_RE.search(phrase)
+                if not match:
+                    continue
+                slot_name = match.group(1)
+                # Слот ищем в исходной фразе, а нормализуем уже половинки:
+                # нормализация съела бы фигурные скобки.
+                prefix = self._normalize_text(phrase[: match.start()])
+                suffix = self._normalize_text(phrase[match.end():])
+                tail, match_score = self._split_slot(words, prefix, suffix)
+                if tail is None:
+                    continue
+                values = self._parse_slot(slot_name, slots.get(slot_name), tail)
+                if not values:
+                    continue
+                # Ранжируем по совпадению с тем окном, где шаблон реально нашёлся,
+                # а не с первыми словами фразы: шаблон может стоять в середине.
+                if best is None or match_score > best[0]:
+                    best = (match_score, cmd_name, values)
+
+        if best is None:
+            return None, {}
+        return best[1], best[2]
+
+    @staticmethod
+    def _fill_slots(value, substitutions):
+        """Подставляет слоты в value шага: «.../episode/{number}/» → «.../episode/312/»."""
+        if not substitutions or not isinstance(value, str) or "{" not in value:
+            return value
+        for name, replacement in substitutions.items():
+            value = value.replace("{" + name + "}", str(replacement))
+        return value
+
+    def _speak_variants(self, text):
+        """Озвучивает одну из фраз, разделённых «|», — как это делает шаг speak."""
+        variants = [part.strip() for part in str(text).split("|") if part.strip()]
+        self.speak(random.choice(variants) if variants else str(text))
+
+    def _report_crypto_rate(self, ticker):
+        """Достаёт курс и озвучивает его в фоне.
+
+        Сеть — это секунды, а сценарий выполняется в потоке распознавания (или
+        в потоке интерфейса, если команду нажали в HUD), поэтому запрос уходит
+        в отдельный поток, а команда не ждёт его ответа.
+        """
+        if crypto_rates is None:
+            self._speak_variants(self.get_command_response(
+                "crypto_fail", "Не смогла достать курс, похоже, сеть шалит, фырк."
+            ))
+            return
+
+        ticker = (ticker or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,12}", ticker):
+            # Либо слот не разрешился («курс крипты» без названия монеты), либо
+            # в редакторе HUD монету написали словами — пробуем понять слово.
+            ticker = crypto_rates.resolve_coin(ticker) or ""
+        if not ticker:
+            self._speak_variants(self.get_command_response(
+                "crypto_ask", "Уточни, курс какой монеты смотрим? Биткоин, эфириум, солана?"
+            ))
+            return
+
+        self.set_status(self.t("ui_status_crypto", "🦊 Смотрю курсы..."), "#FF8C00")
+        threading.Thread(target=self._crypto_worker, args=(ticker,), daemon=True).start()
+
+    def _crypto_worker(self, ticker):
+        lang = self.config.get("language", "ru")
+        try:
+            parts = crypto_rates.get_rate(ticker, lang)
+        except Exception as e:
+            print(f"[Crypto] {ticker}: {e}")
+            parts = None
+
+        if not parts:
+            message = self.get_command_response(
+                "crypto_fail", "Не смогла достать курс, похоже, сеть шалит, фырк."
+            )
+            self.send_to_gui(self.t("ui_crypto_tag", "📈 Курс"), message)
+            self._speak_variants(message)
+            return
+
+        if parts.get("has_usd") and parts.get("has_rub"):
+            key = "crypto_line"
+        elif parts.get("has_rub"):
+            key = "crypto_line_rub"
+        else:
+            key = "crypto_line_usd"
+
+        template = self.get_command_response(
+            key, "{name}: {usd} {usd_word}, а в рублях {rub} {rub_word}."
+        )
+        try:
+            line = template.format(**parts)
+        except (KeyError, IndexError, ValueError):
+            line = f"{parts['name']}: {parts['usd']} {parts['usd_word']}"
+        self.send_to_gui(self.t("ui_crypto_tag", "📈 Курс"), line)
+        self._speak_variants(line)
+
     def execute_command_or_chat(self, command_text, full_phrase):  
         self.send_to_gui(self.t("ui_user_name"), full_phrase)  
         command_text = self._normalize_text(command_text)  
           
         chitchat_reply, chitchat_score = self._match_chitchat(command_text)  
           
-        best_cmd_score = 0  
-        best_cmd = None  
-        cmd_words_count = len(command_text.split())  
+        # Шаблоны со слотами идут первыми: иначе «включи саус парк серия 312»
+        # уедет в команду «включи саус парк» без номера.
+        slot_cmd, slot_values = self._match_slot_command(command_text)
+        if slot_cmd:
+            self.execute_scenario(self.commands[slot_cmd].get("steps", []), slot_values)
+            return
           
-        for cmd_name, cmd_data in self.commands.items():  
-            phrases = [cmd_name] + cmd_data.get("synonyms", [])  
-            for phrase in phrases:  
-                phrase_words_count = len(self._normalize_text(phrase).split())  
-                score = fuzz.ratio(command_text, self._normalize_text(phrase))  
-                if cmd_words_count >= phrase_words_count:  
-                    partial = fuzz.partial_ratio(self._normalize_text(phrase), command_text)  
-                else:  
-                    partial = 0  
-                  
-                final_score = max(score, partial)  
-                if final_score > best_cmd_score:  
-                    best_cmd_score = final_score  
-                    best_cmd = cmd_name  
+        best_cmd, best_cmd_score, _chat = self._score_candidates(command_text)
           
         if chitchat_score >= float(self.config.get("asr_chitchat_strong", 75)) and chitchat_score >= best_cmd_score:  
             if chitchat_reply == "CAPABILITIES_TRIGGER":  
@@ -1147,38 +1826,68 @@ class FoxAssistantCore:
                         data = self.audio_queue.get(timeout=0.1)  
                     except queue.Empty:  
                         continue  
-
-                    if self.asr_engine == "whisper" and self.whisper:
-                        if self.whisper.load_error:
-                            self._fallback_to_vosk(self.whisper.load_error)
-                            continue
-                        heard = self.whisper.feed(data)
-                        if heard:
-                            self.process_recognized_text(heard)
-                        continue
-
-                    if not self.recognizer:  
-                        continue  
-                      
-                    if self.recognizer.AcceptWaveform(data):  
-                        result = json.loads(self.recognizer.Result())  
-                        text = result.get("text", "")  
-                        if text:  
-                            self.process_recognized_text(text)  
-                    else:  
-                        part_json = json.loads(self.recognizer.PartialResult())  
-                        part_text = part_json.get("partial", "").lower()  
-                        if part_text:  
-                            matched_alias, _ = self._extract_wake_and_command(part_text)  
-                            if matched_alias and self.config.get("require_wake_word", True) and not self.is_active_session:  
-                                self.is_active_session = True  
-                                self.last_activation_time = time.time()  
-                                self.set_status(self.t("ui_status_listening"), "#FFD000")  
+                    self._handle_audio_block(data)
                               
         except Exception as e:  
             self.send_to_gui("Audio Error", f"Stream failed: {e}")  
             self.is_listening = False  
-             
+
+    def _handle_audio_block(self, data):
+        """Распознаёт один блок аудио и исполняет законченную фразу.
+
+        Вынесено из `listen_loop` отдельным методом, чтобы это можно было
+        проверить без микрофона: на вход идёт тот же блок, что даёт sounddevice.
+        """
+        if self.asr_engine == "whisper" and self.whisper:
+            if self.whisper.load_error:
+                self._fallback_to_vosk(self.whisper.load_error)
+                return
+            heard = self.whisper.feed(data)
+            if heard:
+                self.process_recognized_text(heard)
+            return
+
+        if not self.recognizer:
+            return
+
+        if self.recognizer.AcceptWaveform(data):
+            text = json.loads(self.recognizer.Result()).get("text", "")
+            if text:
+                self._warn_about_unknown_tokens(text)
+                self.process_recognized_text(text)
+        else:
+            part_text = json.loads(self.recognizer.PartialResult()).get("partial", "").lower()
+            if part_text:
+                matched_alias, _ = self._extract_wake_and_command(part_text)
+                if matched_alias and self.config.get("require_wake_word", True) and not self.is_active_session:
+                    self.is_active_session = True
+                    self.last_activation_time = time.time()
+                    self.set_status(self.t("ui_status_listening"), "#FFD000")
+
+    def _warn_about_unknown_tokens(self, text):
+        """Объясняет, почему в grammar-режиме не работают команды с номером.
+
+        Словарь Vosk — это список готовых фраз, и числительных в нём нет: на
+        записи «серия триста двенадцать» распознаётся как «серия [unk]», а
+        значит команда с номером серии в этом режиме не сработает никогда.
+        Молча терять такое нельзя — человек должен знать, что делать.
+        """
+        if "[unk]" not in text or not self.config.get("asr_grammar", True):
+            return
+        if getattr(self, "_unk_warned", False):
+            return
+        self._unk_warned = True
+        print("[Vosk] [unk] в распознанном тексте: словарь не знает этих слов")
+        self.send_to_gui(
+            self.t("ui_mic_tag"),
+            self.t(
+                "warn_unk_tokens",
+                "Словарь распознавания не знает этих слов — видно по «[unk]». "
+                "Для команд с номером («включи саус парк серия 312») выключи "
+                "asr_grammar в config.json.",
+            ),
+        )
+
     def start_listening(self):
         has_engine = self.model or (self.asr_engine == "whisper" and self.whisper)
         if not self.is_listening and has_engine:

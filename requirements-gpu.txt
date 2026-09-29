@@ -6,8 +6,13 @@
 # Без них ассистент работает на Vosk (CPU) — см. config.json -> asr_engine.
 # Первый запуск скачает модель whisper (~1.6 ГБ для large-v3-turbo) в кэш
 # HuggingFace: %USERPROFILE%\.cache\huggingface
+#
+# Версии зафиксированы по проверенному рабочему окружению (.venv).
 
-faster-whisper>=1.2
+faster-whisper==1.2.1
+# CTranslate2 импортируется напрямую (asr_whisper.py: cuda_info/whisper_available),
+# поэтому версия закреплена явно, а не отдана на откуп транзитивным зависимостям.
+ctranslate2==4.8.2
 # cuBLAS и cuDNN под CUDA 12: CTranslate2 ищет cublas64_12.dll / cudnn64_9.dll
-nvidia-cublas-cu12>=12.4
-nvidia-cudnn-cu12>=9.1
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.26.0.51

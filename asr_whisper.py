@@ -2,7 +2,8 @@
 
 Vosk распознаёт потоково и отдаёт частичные результаты, а whisper работает
 сегментами. Поэтому здесь своя логика: копим аудио, находим конец фразы по
-тишине (энергетический VAD) и распознаём накопленный фрагмент целиком.
+тишине (энергетический VAD из `asr_vad`) и распознаём накопленный фрагмент
+целиком.
 
 Модуль самодостаточен: `assistant_core` только выбирает движок и дёргает
 `feed()` на каждом блоке аудио.
@@ -18,13 +19,20 @@ import time
 
 import numpy as np
 
-SAMPLERATE = 16000
-# Блок аудио приходит по 1600 сэмплов = ровно 100 мс
-FRAME_MS = 100
+from asr_vad import (  # noqa: F401  (константы реэкспортируются для совместимости)
+    ABS_ENERGY_FLOOR,
+    FRAME_MS,
+    HYSTERESIS,
+    MAX_NOISE_FLOOR,
+    SAMPLERATE,
+    SUBFRAME_MS,
+    SUBFRAME_SAMPLES,
+    TAIL_PAD_MS,
+    EnergyVad,
+)
+
 # Ниже этой VRAM видеокарта считается слабой, и whisper не включается
 DEFAULT_MIN_VRAM_MB = 3000
-# Абсолютный порог энергии: тише этого считаем тишиной при любом шуме
-ABS_ENERGY_FLOOR = 0.006
 
 # Типовые галлюцинации whisper на тишине и шуме — отбрасываем их
 HALLUCINATIONS = (
@@ -44,6 +52,8 @@ def prepare_cuda_dlls():
     """
     if os.name != "nt":
         return
+    if getattr(prepare_cuda_dlls, "_done", False):
+        return  # повторный вызов не должен копить одинаковые записи в PATH
     base = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
     if not os.path.isdir(base):
         return
@@ -55,6 +65,7 @@ def prepare_cuda_dlls():
         except (OSError, AttributeError):
             pass
         os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
+    prepare_cuda_dlls._done = True
 
 
 def whisper_available():
@@ -97,7 +108,11 @@ def cuda_info():
             )
             name, vram = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")[:2]]
             info["name"] = name
-            info["vram_mb"] = int(vram)
+            # У виртуальных/гибридных карт память бывает «[N/A]» — это не ошибка,
+            # просто объём неизвестен, и проверка порога его проигнорирует.
+            info["vram_mb"] = int(float(vram))
+        except (ValueError, IndexError):
+            pass
         except Exception:
             pass
     return info
@@ -121,24 +136,28 @@ class WhisperStreamRecognizer:
 
     def __init__(self, model_name="large-v3-turbo", device="cuda",
                  compute_type="int8_float16", language="ru",
-                 silence_ms=700, energy_factor=2.2, max_utterance_s=12.0,
-                 min_speech_ms=300, on_log=None):
+                 silence_ms=1000, energy_factor=2.2, max_utterance_s=12.0,
+                 min_speech_ms=200, on_log=None):
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
         self.language = language
-        self.silence_limit_ms = int(silence_ms)
-        self.energy_factor = float(energy_factor)
-        self.max_utterance_ms = int(max_utterance_s * 1000)
         self.min_speech_ms = int(min_speech_ms)
         self.on_log = on_log
+
+        # Границы фразы считает общий с Vosk модуль: одни и те же настройки
+        # тишины и гистерезиса работают на любом железе.
+        self.vad = EnergyVad(
+            silence_ms=silence_ms,
+            energy_factor=energy_factor,
+            max_utterance_s=max_utterance_s,
+            min_speech_ms=min_speech_ms,
+        )
 
         self.model = None
         self.load_error = None
         self.load_seconds = 0.0
         self._lock = threading.Lock()
-
-        self._reset_state()
 
     # ------------------------------------------------------------------ загрузка
 
@@ -178,16 +197,10 @@ class WhisperStreamRecognizer:
 
     # ------------------------------------------------------------------ состояние
 
-    def _reset_state(self):
-        self._frames = []
-        self._speech_ms = 0
-        self._silence_ms = 0
-        self._in_speech = False
-        self._noise_floor = ABS_ENERGY_FLOOR
-
     def reset(self):
+        """Забывает незаконченную фразу."""
         with self._lock:
-            self._reset_state()
+            self.vad.reset()
 
     # ------------------------------------------------------------------ приём аудио
 
@@ -196,42 +209,15 @@ class WhisperStreamRecognizer:
         if not self.ready:
             return None
 
-        samples = np.frombuffer(pcm_int16_bytes, dtype=np.int16)
-        if samples.size == 0:
-            return None
-
         with self._lock:
-            audio = samples.astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(audio ** 2)))
-            threshold = max(self._noise_floor * self.energy_factor, ABS_ENERGY_FLOOR)
-            loud = rms > threshold
-
-            if loud:
-                if not self._in_speech:
-                    self._in_speech = True
-                    self._frames = []
-                self._speech_ms += FRAME_MS
-                self._silence_ms = 0
-                self._frames.append(audio)
-            elif self._in_speech:
-                self._silence_ms += FRAME_MS
-                self._frames.append(audio)
-            else:
-                # Тишина до начала речи — подстраиваем уровень шума под комнату
-                self._noise_floor = 0.9 * self._noise_floor + 0.1 * max(rms, 1e-5)
+            if not self.vad.push(pcm_int16_bytes):
                 return None
+            utterance, speech_ms = self.vad.take_audio()
 
-            finished = (self._in_speech and self._silence_ms >= self.silence_limit_ms) \
-                or self._speech_ms >= self.max_utterance_ms
-            if not finished:
-                return None
-
-            frames, speech_ms = self._frames, self._speech_ms
-            self._reset_state()
-
-        if speech_ms < self.min_speech_ms:
+        # Слишком короткий всплеск — это щелчок или кашель, а не команда.
+        if utterance is None or speech_ms < self.min_speech_ms:
             return None
-        return self._transcribe(np.concatenate(frames))
+        return self._transcribe(utterance)
 
     # ------------------------------------------------------------------ распознавание
 
