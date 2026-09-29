@@ -181,6 +181,7 @@ class FoxAssistantApp(ctk.CTk):
             act_map.get("type_text", "type_text"): "type_text",
             act_map.get("run_cmd", "run_cmd"): "run_cmd",
             act_map.get("screenshot", "screenshot"): "screenshot",
+            act_map.get("crypto_rate", "crypto_rate"): "crypto_rate",
             act_map.get("set_volume", "set_volume"): "set_volume",
             act_map.get("pause", "pause"): "pause",
             act_map.get("volume_up", "volume_up"): "volume_up",

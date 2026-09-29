@@ -445,6 +445,81 @@
                     "value": ""
                 }
             ]
+        },
+        "play south park": {
+            "synonyms": [
+                "south park",
+                "put on south park",
+                "random south park episode",
+                "start south park"
+            ],
+            "steps": [
+                {
+                    "action": "open_url",
+                    "value": "https://sp3.freehat.cc/episode/rand.php"
+                },
+                {
+                    "action": "speak",
+                    "value": "Spinning the South Park roulette — whichever episode comes up is the one we watch, ururu! | South Park incoming! Opening a random episode, grab the popcorn, yip!"
+                }
+            ]
+        },
+        "play south park episode {number}": {
+            "synonyms": [
+                "south park episode {number}",
+                "south park {number}",
+                "play south park episode {number}"
+            ],
+            "slots": {
+                "number": {
+                    "type": "number"
+                }
+            },
+            "steps": [
+                {
+                    "action": "open_url",
+                    "value": "https://sp3.freehat.cc/episode/{number}/"
+                },
+                {
+                    "action": "speak",
+                    "value": "Opening South Park, episode {digits}. Enjoy the show, yip! | South Park, episode {digits} — here we go, ururu!"
+                }
+            ]
+        },
+        "bitcoin rate": {
+            "synonyms": [
+                "bitcoin price",
+                "how much is bitcoin",
+                "btc rate",
+                "price of bitcoin",
+                "bitcoin"
+            ],
+            "steps": [
+                {
+                    "action": "crypto_rate",
+                    "value": "BTC"
+                }
+            ]
+        },
+        "crypto rate": {
+            "synonyms": [
+                "rate of {coin}",
+                "price of {coin}",
+                "how much is {coin}",
+                "{coin} price",
+                "what is {coin} worth"
+            ],
+            "slots": {
+                "coin": {
+                    "type": "coin"
+                }
+            },
+            "steps": [
+                {
+                    "action": "crypto_rate",
+                    "value": "{coin}"
+                }
+            ]
         }
     },
     "responses": {
@@ -464,7 +539,7 @@
             "I might be a mythical spirit, but even my nine tails couldn't decode that! Try again, human?"
         ],
         "skills_header": "Scroll of Skills ({count}):\n{list}",
-        "skills_speak": "I can guard against sleep, lock buttons from kitty paws, launch music, YouTube, Telegram and cinema, manage volume, take screenshots, and tuck away into the tray. Full scroll printed in the terminal, enjoy, ururu!",
+        "skills_speak": "I can guard against sleep, lock buttons from kitty paws, launch music, YouTube, Telegram, cinema and South Park, read out crypto rates, manage volume, take screenshots, and tuck away into the tray. Full scroll printed in the terminal, enjoy, ururu!",
         "cat_locked_msg": "Purple shield active! Keyboard asleep, the kitty can nap peacefully!",
         "cat_unlocked_msg": "Kitty shooed away! Keyboard unlocked, ready to type.",
         "pwr_5min_msg": "Mode: Den Snooze (Sleep: 5m | Screen: 5m)",
@@ -473,7 +548,12 @@
         "pwr_never_speak": "I am on watch! Sleep disabled, screen stays awake!",
         "pwr_status_never": "Watch mode is active! Sleep is disabled, screen stays awake and bright, ururu!",
         "pwr_status_5min": "Den snooze mode is active! If left untouched for five minutes, the screen will sleep and I'll snooze, yip!",
-        "screenshot_msg": "Screenshot safely cached: {filename}"
+        "screenshot_msg": "Screenshot safely cached: {filename}",
+        "crypto_line": "{name} is {usd} {usd_word}, and {rub} {rub_word} in rubles. | Checking {name}: {usd} {usd_word}, {rub} {rub_word}, ururu!",
+        "crypto_line_rub": "Could not get the dollar price, but {name} is {rub} {rub_word}, yip.",
+        "crypto_line_usd": "Could not get the ruble price, but {name} is {usd} {usd_word}, ururu.",
+        "crypto_fail": "I could not fetch the rate: either the network blinked or the exchange is thinking, yip. | No rate came through, ururu. Try again a bit later.",
+        "crypto_ask": "Which coin should I check? Bitcoin, Ethereum, Solana, TON? | Name the coin a bit more clearly and I will look it up, ururu!"
     },
     "chitchat": {
         "praise": {

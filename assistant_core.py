@@ -39,11 +39,116 @@ except Exception as _tts_import_error:  # модуль опционален: б�
     tts_local = None
     print(f"[TTS] Модуль tts_local недоступен: {_tts_import_error}")
 
+try:
+    import crypto_rates
+except Exception as _rates_import_error:  # модуль опционален: без него нет команд «курс ...»
+    crypto_rates = None
+    print(f"[Rates] Модуль crypto_rates недоступен: {_rates_import_error}")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COMMANDS_DIR = os.path.join(BASE_DIR, "commands")
 MARKER_FILE = os.path.expanduser(r"~\\.sleep_never_marker")  
-  
+
+# =====================================================================
+# СЛОТЫ КОМАНД: «включи саус парк серия 312», «курс биткоина»
+# =====================================================================
+
+#: Именованная дырка в шаблоне команды, например "включи саус парк серия {number}".
+#: Слот всегда стоит в хвосте фразы — так его значение не надо выковыривать
+#: из середины, а короткий шаблон без слота не спорит с шаблоном со слотом.
+SLOT_TOKEN_RE = re.compile(r"\{(\w+)\}")
+
+#: Порог похожести шаблона, выше обычного командного: «включи саус парк» не
+#: должно ловиться шаблоном «саус парк {number}». Подлинность значения слота
+#: проверяется отдельно, поэтому здесь важнее строгость, чем терпимость к ASR.
+SLOT_PREFIX_THRESHOLD = 76
+
+#: Слова-цифры и числительные: пользователь может продиктовать код серии
+#: цифрами («312»), по одной цифре («три один два») или числом
+#: («сто двенадцать»). Английские формы нужны для en.command.
+ONE_DIGIT_WORDS = {
+    "ноль": "0", "нуль": "0", "zero": "0", "oh": "0",
+    "один": "1", "одна": "1", "одно": "1", "one": "1",
+    "два": "2", "две": "2", "two": "2",
+    "три": "3", "three": "3",
+    "четыре": "4", "four": "4",
+    "пять": "5", "five": "5",
+    "шесть": "6", "six": "6",
+    "семь": "7", "seven": "7",
+    "восемь": "8", "eight": "8",
+    "девять": "9", "nine": "9",
+}
+
+#: Числительные целиком — собираются сложением разрядов: «сто двадцать три».
+RU_NUMBER_VALUES = {
+    "ноль": 0, "нуль": 0, "один": 1, "одна": 1, "одно": 1, "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8,
+    "девять": 9, "десять": 10, "одиннадцать": 11, "двенадцать": 12,
+    "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16,
+    "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20,
+    "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60,
+    "семьдесят": 70, "восемьдесят": 80, "девяносто": 90, "сто": 100,
+    "двести": 200, "триста": 300, "четыреста": 400, "пятьсот": 500,
+    "шестьсот": 600, "семьсот": 700, "восемьсот": 800, "девятьсот": 900,
+    "тысяча": 1000, "тысячи": 1000, "тысяч": 1000,
+}
+
+#: Как номер проговаривается по цифрам — требование к команде серии.
+RU_SPOKEN_DIGITS = (
+    "ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь",
+    "восемь", "девять",
+)
+EN_SPOKEN_DIGITS = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine",
+)
+
+
+def canonical_number(digits):
+    """Убирает ведущие нули.
+
+    Сайт сериалов отдаёт /episode/101/, а /episode/0101/ и /episode/1/ — 404,
+    поэтому «ноль один ноль один» должно превратиться в 101, а не в 101 или 0101.
+    """
+    stripped = (digits or "").lstrip("0")
+    return stripped or "0"
+
+
+def parse_slot_number(text):
+    """Разбирает продиктованный номер и возвращает строку цифр или None."""
+    tokens = (text or "").split()
+    if not tokens:
+        return None
+
+    # Написано цифрами: «312» или «3 1 2».
+    if all(token.isdigit() for token in tokens):
+        return canonical_number("".join(tokens))
+
+    # Продиктовано по одной цифре: «три один два», «ноль один ноль один».
+    if all(token in ONE_DIGIT_WORDS for token in tokens):
+        return canonical_number("".join(ONE_DIGIT_WORDS[token] for token in tokens))
+
+    # Числительное: «сто двенадцать».
+    total, current = 0, 0
+    for token in tokens:
+        value = RU_NUMBER_VALUES.get(token)
+        if value is None:
+            return None
+        if value >= 1000:
+            total += (current or 1) * 1000
+            current = 0
+        else:
+            current += value
+    return canonical_number(str(total + current))
+
+
+def spoken_digits(digits, lang="ru"):
+    """Проговаривает номер по одной цифре: «312» → «три один два»."""
+    words = RU_SPOKEN_DIGITS if lang == "ru" else EN_SPOKEN_DIGITS
+    return " ".join(words[int(ch)] for ch in str(digits) if ch.isdigit())
+
+
 DEFAULT_CONFIG = {  
     "wake_word": "лисичка",  
     "wake_aliases": [  
@@ -276,6 +381,11 @@ class FoxAssistantCore:
         for phrase in phrases:
             norm = self._normalize_text(phrase)
             if not norm or norm in seen:
+                continue
+            # Шаблоны со слотами в грамматику не годятся: Vosk — это список
+            # готовых фраз, «серия {number}» с любым номером туда не вписать, а
+            # нормализация превратила бы {number} в лишнее слово «number».
+            if SLOT_TOKEN_RE.search(phrase):
                 continue
             # Русская модель не знает латиницы — такие фразы Vosk всё равно
             # отбросит, поэтому не засоряем ими грамматику.
@@ -595,10 +705,13 @@ class FoxAssistantCore:
         if old_name and old_name in target_cmds and old_name != cmd_name:
             del target_cmds[old_name]
 
-        target_cmds[cmd_name] = {
-            "synonyms": synonyms if synonyms is not None else [],
-            "steps": steps
-        }
+        # Переносим прочие поля прежнего определения: у команд со слотами
+        # («включи саус парк серия {number}») есть секция slots, и редактор HUD
+        # не должен терять её при сохранении.
+        entry = dict(target_cmds.get(cmd_name) or {})
+        entry["synonyms"] = synonyms if synonyms is not None else []
+        entry["steps"] = steps
+        target_cmds[cmd_name] = entry
         self.save_lang_command_file(lang, target_data)
         self.load_all_commands()
 
@@ -1047,11 +1160,13 @@ class FoxAssistantCore:
         except queue.Full:  
             pass  
          
-    def execute_scenario(self, steps):  
+    def execute_scenario(self, steps, slots=None):  
+        """Выполняет шаги команды, подставляя значения слотов в action value."""
+        substitutions = dict(slots or {})
         self.set_status(self.t("ui_status_conjuring"), "#FF8C00")  
         for step in steps:  
             action = step.get("action")  
-            val = step.get("value", "")  
+            val = self._fill_slots(step.get("value", ""), substitutions)  
             try:  
                 if action == "speak":  
                     if "|" in val:
@@ -1133,6 +1248,8 @@ class FoxAssistantCore:
                     pyautogui.screenshot(str(filename))  
                     msg = self.get_command_response("screenshot_msg", "Снимок экрана сохранен: {filename}").format(filename=filename.name)  
                     self.send_to_gui(self.t("ui_screenshot_tag", "🐾 След"), msg)  
+                elif action == "crypto_rate":  
+                    self._report_crypto_rate(val)
                 elif action == "lock_pc":  
                     ctypes.windll.user32.LockWorkStation()  
                 elif action == "sleep_pc":  
@@ -1216,11 +1333,190 @@ class FoxAssistantCore:
          
         return None, best_score  
          
+    # -----------------------------------------------------------------
+    # Команды со слотами: «включи саус парк серия 312», «курс биткоина»
+    # -----------------------------------------------------------------
+
+    def _parse_slot(self, name, spec, text):
+        """Превращает хвост фразы в подстановки для шагов команды.
+
+        Возвращает словарь вроде {"number": "312", "digits": "три один два"}
+        или None, если хвост на значение слота не похож.
+        """
+        kind = (spec or {}).get("type", "number")
+        if kind == "number":
+            number = parse_slot_number(text)
+            if not number:
+                return None
+            lang = self.config.get("language", "ru")
+            return {"number": number, "digits": spoken_digits(number, lang)}
+        if kind == "coin":
+            ticker = crypto_rates.resolve_coin(text) if crypto_rates else None
+            if not ticker:
+                return None
+            return {"coin": ticker}
+        return None
+
+    def _split_slot(self, words, prefix, suffix):
+        """Ищет шаблон во фразе и возвращает хвост — значение слота.
+
+        Шаблон сравнивается скользящим окном в несколько слов, и окно может
+        стоять не в самом начале: «включи саус парк 312» должно разобраться как
+        шаблон «саус парк» плюс номер. Значение слота — всегда конец фразы,
+        поэтому окно не доходит до последнего слова.
+        """
+        prefix_words = prefix.split()
+        if not prefix_words:
+            return None
+        base = len(prefix_words)
+        best = None  # (счёт, индекс конца шаблона)
+        for size in (base, base + 1, base - 1):
+            if size < 1 or size >= len(words):
+                continue
+            for start in range(0, len(words) - size):
+                score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
+                if best is None or score > best[0]:
+                    best = (score, start + size)
+        if best is None or best[0] < SLOT_PREFIX_THRESHOLD:
+            return None
+
+        tail = words[best[1]:]
+        suffix_words = suffix.split()
+        if suffix_words:
+            if len(tail) <= len(suffix_words):
+                return None
+            literal = " ".join(tail[-len(suffix_words):])
+            if fuzz.ratio(literal, suffix) < SLOT_PREFIX_THRESHOLD:
+                return None
+            tail = tail[:-len(suffix_words)]
+        return " ".join(tail).strip() or None
+
+    def _match_slot_command(self, command_text):
+        """Ищет команду-шаблон со слотом. Возвращает (имя команды, подстановки).
+
+        Общий нечёткий перебор тут не годится: фраза с номером серии не совпадёт
+        целиком ни с одной фразой словаря, зато её перетянет короткая команда без
+        номера («включи саус парк»). Поэтому шаблоны со слотами разбираются
+        отдельно и раньше общего перебора.
+        """
+        words = (command_text or "").split()
+        if not words:
+            return None, {}
+
+        best = None  # (счёт, имя команды, подстановки)
+        for cmd_name, cmd_data in self.commands.items():
+            slots = cmd_data.get("slots") or {}
+            if not slots:
+                continue
+            for phrase in [cmd_name] + cmd_data.get("synonyms", []):
+                match = SLOT_TOKEN_RE.search(phrase)
+                if not match:
+                    continue
+                slot_name = match.group(1)
+                # Слот ищем в исходной фразе, а нормализуем уже половинки:
+                # нормализация съела бы фигурные скобки.
+                prefix = self._normalize_text(phrase[: match.start()])
+                suffix = self._normalize_text(phrase[match.end():])
+                tail = self._split_slot(words, prefix, suffix)
+                if tail is None:
+                    continue
+                values = self._parse_slot(slot_name, slots.get(slot_name), tail)
+                if not values:
+                    continue
+                score = fuzz.ratio(" ".join(words[:len(prefix.split())]), prefix)
+                if best is None or score > best[0]:
+                    best = (score, cmd_name, values)
+
+        if best is None:
+            return None, {}
+        return best[1], best[2]
+
+    @staticmethod
+    def _fill_slots(value, substitutions):
+        """Подставляет слоты в value шага: «.../episode/{number}/» → «.../episode/312/»."""
+        if not substitutions or not isinstance(value, str) or "{" not in value:
+            return value
+        for name, replacement in substitutions.items():
+            value = value.replace("{" + name + "}", str(replacement))
+        return value
+
+    def _speak_variants(self, text):
+        """Озвучивает одну из фраз, разделённых «|», — как это делает шаг speak."""
+        variants = [part.strip() for part in str(text).split("|") if part.strip()]
+        self.speak(random.choice(variants) if variants else str(text))
+
+    def _report_crypto_rate(self, ticker):
+        """Достаёт курс и озвучивает его в фоне.
+
+        Сеть — это секунды, а сценарий выполняется в потоке распознавания (или
+        в потоке интерфейса, если команду нажали в HUD), поэтому запрос уходит
+        в отдельный поток, а команда не ждёт его ответа.
+        """
+        if crypto_rates is None:
+            self._speak_variants(self.get_command_response(
+                "crypto_fail", "Не смогла достать курс, похоже, сеть шалит, фырк."
+            ))
+            return
+
+        ticker = (ticker or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,12}", ticker):
+            # Либо слот не разрешился («курс крипты» без названия монеты), либо
+            # в редакторе HUD монету написали словами — пробуем понять слово.
+            ticker = crypto_rates.resolve_coin(ticker) or ""
+        if not ticker:
+            self._speak_variants(self.get_command_response(
+                "crypto_ask", "Уточни, курс какой монеты смотрим? Биткоин, эфириум, солана?"
+            ))
+            return
+
+        self.set_status(self.t("ui_status_crypto", "🦊 Смотрю курсы..."), "#FF8C00")
+        threading.Thread(target=self._crypto_worker, args=(ticker,), daemon=True).start()
+
+    def _crypto_worker(self, ticker):
+        lang = self.config.get("language", "ru")
+        try:
+            parts = crypto_rates.get_rate(ticker, lang)
+        except Exception as e:
+            print(f"[Crypto] {ticker}: {e}")
+            parts = None
+
+        if not parts:
+            message = self.get_command_response(
+                "crypto_fail", "Не смогла достать курс, похоже, сеть шалит, фырк."
+            )
+            self.send_to_gui(self.t("ui_crypto_tag", "📈 Курс"), message)
+            self._speak_variants(message)
+            return
+
+        if parts.get("has_usd") and parts.get("has_rub"):
+            key = "crypto_line"
+        elif parts.get("has_rub"):
+            key = "crypto_line_rub"
+        else:
+            key = "crypto_line_usd"
+
+        template = self.get_command_response(
+            key, "{name}: {usd} {usd_word}, а в рублях {rub} {rub_word}."
+        )
+        try:
+            line = template.format(**parts)
+        except (KeyError, IndexError, ValueError):
+            line = f"{parts['name']}: {parts['usd']} {parts['usd_word']}"
+        self.send_to_gui(self.t("ui_crypto_tag", "📈 Курс"), line)
+        self._speak_variants(line)
+
     def execute_command_or_chat(self, command_text, full_phrase):  
         self.send_to_gui(self.t("ui_user_name"), full_phrase)  
         command_text = self._normalize_text(command_text)  
           
         chitchat_reply, chitchat_score = self._match_chitchat(command_text)  
+          
+        # Шаблоны со слотами идут первыми: иначе «включи саус парк серия 312»
+        # уедет в команду «включи саус парк» без номера.
+        slot_cmd, slot_values = self._match_slot_command(command_text)
+        if slot_cmd:
+            self.execute_scenario(self.commands[slot_cmd].get("steps", []), slot_values)
+            return
           
         best_cmd_score = 0  
         best_cmd = None  
