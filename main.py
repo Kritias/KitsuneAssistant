@@ -151,6 +151,16 @@ class FoxAssistantApp(ctk.CTk):
         return self.lang.get(key, default if default else key)
 
     def get_available_input_devices(self):
+        """Список устройств ввода: [(индекс, название), ...].
+
+        PortAudio показывает одно и то же устройство в каждом Host API
+        (MME, DirectSound, WASAPI, WDM-KS) — без фильтра у одной веб-камеры
+        оказывается 3–4 копии. Оставляем WASAPI: он родной для Windows, у
+        остальных API у устройств другие индексы и латентности, и выбрать
+        их в config можно только случайно. Псевдоустройства (Sound Mapper,
+        «первичный драйвер») и служебные записи с мусорными именами
+        (@System32\...) отбрасываются по чёрному списку.
+        """
         devices = []
         seen_names = set()
         blacklist = [
@@ -159,35 +169,42 @@ class FoxAssistantApp(ctk.CTk):
             "переназначение",
             "mapper",
             "@system32",
-            "input ()"
+            "input ()",
         ]
         try:
             import sounddevice as sd
             devs = sd.query_devices()
             hostapis = sd.query_hostapis()
-            
+
             wasapi_id = None
             for h_idx, h in enumerate(hostapis):
-                if 'WASAPI' in h.get('name', ''):
+                if "WASAPI" in h.get("name", ""):
                     wasapi_id = h_idx
                     break
-            
+
             for idx, dev in enumerate(devs):
-                if dev['max_input_channels'] > 0:
-                    if wasapi_id is not None and dev['hostapi'] != wasapi_id:
-                        continue
-                    
-                    name = dev['name'].strip()
-                    if not name or name == "()":
-                        continue
-                        
-                    name_lower = name.lower()
-                    if any(bad in name_lower for bad in blacklist):
-                        continue
-                        
-                    if name not in seen_names:
-                        seen_names.add(name)
-                        devices.append((idx, name))
+                if dev["max_input_channels"] <= 0:
+                    continue
+                # Без WASAPI (старый PortAudio, не-Windows) берём все входы.
+                if wasapi_id is not None and dev["hostapi"] != wasapi_id:
+                    continue
+
+                name = dev["name"].strip()
+                # WDM-KS отдаёт имена вида «@System32\drivers\bthhfenum.sys,
+                # #2;%1 Hands-Free…» — нечитаемые, для выбора не годятся.
+                if not name or name.startswith("@") or name == "()":
+                    continue
+
+                name_lower = name.lower()
+                if any(bad in name_lower for bad in blacklist):
+                    continue
+
+                # Страховка: два Host API с совпадающими именами не должны
+                # задвоить устройство в списке.
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                devices.append((idx, name))
         except Exception:
             pass
         return devices

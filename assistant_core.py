@@ -1563,27 +1563,46 @@ class FoxAssistantCore:
         стоять не в самом начале: «включи саус парк 312» должно разобрать как
         шаблон «саус парк» плюс номер. Значение слота — всегда конец фразы,
         поэтому за окном должно остаться хоть одно слово.
+
+        Шаблон бывает и без префикса («{coin} курс», «{coin} price»): тогда
+        ищется суффикс, а слот — всё, что перед ним.
         """
         prefix_words = prefix.split()
-        if not prefix_words:
+        suffix_words = suffix.split()
+        if not prefix_words and not suffix_words:
             return None, 0
-        base = len(prefix_words)
+
         best = None  # (счёт, индекс конца шаблона)
-        for size in (base, base + 1, base - 1):
-            if size < 1:
-                continue
+
+        if not prefix_words:
+            # Только суффикс: окно суффикса идёт по всей фразе, слот — до него.
+            size = len(suffix_words)
             for start in range(0, len(words) - size + 1):
-                if start + size >= len(words):
-                    continue  # за шаблоном должно остаться значение слота
-                score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
+                if start == 0:
+                    continue  # перед суффиксом должно быть значение слота
+                score = fuzz.ratio(" ".join(words[start:start + size]), suffix)
                 if best is None or score > best[0]:
-                    best = (score, start + size)
+                    best = (score, start)
+        else:
+            base = len(prefix_words)
+            for size in (base, base + 1, base - 1):
+                if size < 1:
+                    continue
+                for start in range(0, len(words) - size + 1):
+                    if start + size >= len(words):
+                        continue  # за шаблоном должно остаться значение слота
+                    score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
+                    if best is None or score > best[0]:
+                        best = (score, start + size)
         if best is None or best[0] < SLOT_PREFIX_THRESHOLD:
             return None, 0
 
-        tail = words[best[1]:]
-        suffix_words = suffix.split()
-        if suffix_words:
+        # В префиксной ветке best[1] — конец шаблона: хвост после него.
+        # В суффиксной (best = (score, start)) best[1] — начало суффикса,
+        # и хвост — всё, что до него; сам суффикс туда не входит, вычитать
+        # его второй раз нельзя.
+        tail = words[best[1]:] if prefix_words else words[:best[1]]
+        if prefix_words and suffix_words:
             if len(tail) <= len(suffix_words):
                 return None, 0
             literal = " ".join(tail[-len(suffix_words):])
