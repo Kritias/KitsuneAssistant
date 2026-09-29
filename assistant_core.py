@@ -45,6 +45,12 @@ except Exception as _rates_import_error:  # модуль опционален: �
     crypto_rates = None
     print(f"[Rates] Модуль crypto_rates недоступен: {_rates_import_error}")
 
+try:
+    import cbr_rates
+except Exception as _cbr_import_error:  # модуль опционален: без него нет «курс валюты»
+    cbr_rates = None
+    print(f"[CBR] Модуль cbr_rates недоступен: {_cbr_import_error}")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COMMANDS_DIR = os.path.join(BASE_DIR, "commands")
@@ -1511,6 +1517,8 @@ class FoxAssistantCore:
                     self.send_to_gui(self.t("ui_screenshot_tag", "🐾 След"), msg)  
                 elif action == "crypto_rate":  
                     self._report_crypto_rate(val)
+                elif action == "fiat_rate":
+                    self._report_fiat_rate(val)
                 elif action == "lock_pc":  
                     ctypes.windll.user32.LockWorkStation()  
                 elif action == "sleep_pc":  
@@ -1616,6 +1624,21 @@ class FoxAssistantCore:
             if not ticker:
                 return None
             return {"coin": ticker}
+        if kind == "currency":
+            # Хвост может нести и дату: «доллара на 15 марта» / «евро на вчера».
+            if cbr_rates is None:
+                return None
+            code, day = cbr_rates.parse_currency_query(text)
+            if not code:
+                return None
+            if day is None:
+                # Валюта понятна, дата — нет: передаём маркер, worker скажет отдельно.
+                return {"currency": code, "date": "", "date_iso": "bad"}
+            return {
+                "currency": code,
+                "date": day.strftime("%d.%m.%Y"),
+                "date_iso": day.isoformat(),
+            }
         return None
 
     def _split_slot(self, words, prefix, suffix):
@@ -1790,6 +1813,85 @@ class FoxAssistantCore:
         except (KeyError, IndexError, ValueError):
             line = f"{parts['name']}: {parts['usd']} {parts['usd_word']}"
         self.send_to_gui(self.t("ui_crypto_tag", "📈 Курс"), line)
+        self._speak_variants(line)
+
+    def _report_fiat_rate(self, value):
+        """Официальный курс ЦБ на дату. Значение шага: ``USD`` или ``USD|2024-03-15``.
+
+        Дата опциональна: пустая или отсутствующая — сегодня. Маркер ``bad``
+        значит, что валюта распознана, а дата в хвосте фразы — нет.
+        """
+        if cbr_rates is None:
+            self._speak_variants(self.get_command_response(
+                "fiat_fail", "Не смогла достать курс ЦБ, похоже, сеть шалит, фырк."
+            ))
+            return
+
+        raw = (value or "").strip()
+        code, date_iso = raw, ""
+        if "|" in raw:
+            code, date_iso = [part.strip() for part in raw.split("|", 1)]
+
+        code = code.upper()
+        if not re.fullmatch(r"[A-Z]{3}", code):
+            parsed_code, parsed_day = cbr_rates.parse_currency_query(raw)
+            code = parsed_code or ""
+            if parsed_day is not None:
+                date_iso = parsed_day.isoformat()
+            elif parsed_code and not date_iso:
+                date_iso = "bad"
+
+        if not code:
+            self._speak_variants(self.get_command_response(
+                "fiat_ask",
+                "Уточни валюту: доллар, евро, юань, фунт? Можно и дату: курс доллара на вчера.",
+            ))
+            return
+        if date_iso == "bad":
+            self._speak_variants(self.get_command_response(
+                "fiat_bad_date",
+                "Дату не разобрала, уруру. Скажи «вчера», «15 марта» или «15.03.2024».",
+            ))
+            return
+
+        self.set_status(self.t("ui_status_fiat", "🦊 Смотрю курс ЦБ..."), "#FF8C00")
+        threading.Thread(
+            target=self._fiat_worker, args=(code, date_iso), daemon=True
+        ).start()
+
+    def _fiat_worker(self, code, date_iso):
+        from datetime import date as _date
+
+        lang = self.config.get("language", "ru")
+        on_date = None
+        if date_iso:
+            try:
+                on_date = _date.fromisoformat(date_iso)
+            except ValueError:
+                on_date = None
+        try:
+            parts = cbr_rates.get_rate(code, on_date=on_date, lang=lang)
+        except Exception as e:
+            print(f"[CBR] {code} @ {date_iso}: {e}")
+            parts = None
+
+        if not parts:
+            message = self.get_command_response(
+                "fiat_fail", "Не смогла достать курс ЦБ, похоже, сеть шалит, фырк."
+            )
+            self.send_to_gui(self.t("ui_fiat_tag", "🏦 Курс ЦБ"), message)
+            self._speak_variants(message)
+            return
+
+        key = "fiat_line_today" if parts.get("is_today") else "fiat_line"
+        template = self.get_command_response(
+            key, "Официальный курс {name} на {date_spoken}: {rate} {rate_word}."
+        )
+        try:
+            line = template.format(**parts)
+        except (KeyError, IndexError, ValueError):
+            line = f"{parts['name']} на {parts['date_spoken']}: {parts['rate']} {parts['rate_word']}"
+        self.send_to_gui(self.t("ui_fiat_tag", "🏦 Курс ЦБ"), line)
         self._speak_variants(line)
 
     def execute_command_or_chat(self, command_text, full_phrase):  

@@ -504,6 +504,27 @@
                     "value": "{coin}"
                 }
             ]
+        },
+        "currency rate": {
+            "synonyms": [
+                "currency rate of {currency}",
+                "official rate of {currency}",
+                "central bank rate of {currency}",
+                "{currency} rate from the central bank",
+                "cbr rate of {currency}",
+                "what is the official {currency} rate"
+            ],
+            "slots": {
+                "currency": {
+                    "type": "currency"
+                }
+            },
+            "steps": [
+                {
+                    "action": "fiat_rate",
+                    "value": "{currency}|{date_iso}"
+                }
+            ]
         }
     },
     "responses": {
@@ -523,7 +544,7 @@
             "I might be a mythical spirit, but even my nine tails couldn't decode that! Try again, human?"
         ],
         "skills_header": "Scroll of Skills ({count}):\n{list}",
-        "skills_speak": "I can guard against sleep, lock buttons from kitty paws, launch music, YouTube, Telegram, cinema and South Park, read out crypto rates, manage volume, take screenshots, and tuck away into the tray. Full scroll printed in the terminal, enjoy, ururu!",
+        "skills_speak": "I can guard against sleep, lock buttons from kitty paws, launch music, YouTube, Telegram, cinema and South Park, read out crypto rates and official CBR currency rates for any date, manage volume, take screenshots, and tuck away into the tray. Full scroll printed in the terminal, enjoy, ururu!",
         "cat_locked_msg": "Purple shield active! Keyboard asleep, the kitty can nap peacefully!",
         "cat_unlocked_msg": "Kitty shooed away! Keyboard unlocked, ready to type.",
         "pwr_5min_msg": "Mode: Den Snooze (Sleep: 5m | Screen: 5m)",
@@ -537,7 +558,12 @@
         "crypto_line_rub": "Could not get the dollar price, but {name} is {rub} {rub_word}, yip.",
         "crypto_line_usd": "Could not get the ruble price, but {name} is {usd} {usd_word}, ururu.",
         "crypto_fail": "I could not fetch the rate: either the network blinked or the exchange is thinking, yip. | No rate came through, ururu. Try again a bit later.",
-        "crypto_ask": "Which coin should I check? Bitcoin, Ethereum, Solana, TON? | Name the coin a bit more clearly and I will look it up, ururu!"
+        "crypto_ask": "Which coin should I check? Bitcoin, Ethereum, Solana, TON? | Name the coin a bit more clearly and I will look it up, ururu!",
+        "fiat_line_today": "Official rate of {name} for today: {rate} {rate_word}. | CBR says {name} is {rate} {rate_word} today, ururu!",
+        "fiat_line": "Official rate of {name} on {date_spoken}: {rate} {rate_word}. | Checking the CBR: {name} on {date_spoken} was {rate} {rate_word}, yip!",
+        "fiat_fail": "Could not fetch the CBR rate: either the network blinked or there is no rate for that date, yip. | No CBR rate came through, ururu. Try again later.",
+        "fiat_ask": "Which currency should I check? Dollar, euro, yuan, pound? You can also add a date: dollar rate for yesterday, ururu!",
+        "fiat_bad_date": "Got the currency, but not the date, yip. Say yesterday, March 15, or 15.03.2024."
     },
     "chitchat": {
         "praise": {
