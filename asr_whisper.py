@@ -52,6 +52,8 @@ def prepare_cuda_dlls():
     """
     if os.name != "nt":
         return
+    if getattr(prepare_cuda_dlls, "_done", False):
+        return  # повторный вызов не должен копить одинаковые записи в PATH
     base = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia")
     if not os.path.isdir(base):
         return
@@ -63,6 +65,7 @@ def prepare_cuda_dlls():
         except (OSError, AttributeError):
             pass
         os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
+    prepare_cuda_dlls._done = True
 
 
 def whisper_available():
@@ -105,7 +108,11 @@ def cuda_info():
             )
             name, vram = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")[:2]]
             info["name"] = name
-            info["vram_mb"] = int(vram)
+            # У виртуальных/гибридных карт память бывает «[N/A]» — это не ошибка,
+            # просто объём неизвестен, и проверка порога его проигнорирует.
+            info["vram_mb"] = int(float(vram))
+        except (ValueError, IndexError):
+            pass
         except Exception:
             pass
     return info

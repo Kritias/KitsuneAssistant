@@ -38,7 +38,15 @@ CBR_DAILY_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
 #: Держим курс минуту: за это время он не уедет, а лишние запросы при
 #: нескольких подряд командах «курс ...» никому не нужны.
 CACHE_TTL = 60.0
+#: Курс ЦБ меняется раз в сутки, а нужен для каждой монеты без прямой пары
+#: с рублём: без своего кэша «курс биткоина» и «курс эфириума» подряд дважды
+#: ходили бы за одним и тем же числом.
+CBR_CACHE_TTL = 3600.0
+#: Верхняя граница ответа API: тикер — это десятки байт, и всё, что сильно
+#: больше, — не цена, а чужая страница ошибки или мусор прокси.
+MAX_RESPONSE_BYTES = 1_000_000
 _cache: dict[str, tuple[float, dict]] = {}
+_cbr_cache: tuple[float, float] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +253,12 @@ def _get_json(url: str) -> dict | None:
     )
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            return json.loads(response.read().decode("utf-8", "replace"))
+            # Лимит защищает от «ответа» на несколько гигабайт: при сбое DNS
+            # или подмене адреса some-CDN может отдать страницу-заглушку.
+            data = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                return None
+            return json.loads(data.decode("utf-8", "replace"))
     except Exception:
         return None
 
@@ -279,14 +292,26 @@ def fetch_usd(ticker: str) -> tuple[float | None, str]:
 
 
 def usd_rub_rate() -> float | None:
-    """Официальный курс ЦБ РФ: рублей за один доллар."""
+    """Официальный курс ЦБ РФ: рублей за один доллар.
+
+    Кэшируется на час: курс обновляется раз в сутки, а без кэша каждая монета
+    без прямой рублёвой пары ходила бы за ним отдельно.
+    """
+    global _cbr_cache
+    now = time.time()
+    if _cbr_cache and now - _cbr_cache[0] < CBR_CACHE_TTL:
+        return _cbr_cache[1]
+
     data = _get_json(CBR_DAILY_URL)
     try:
         usd = data["Valute"]["USD"]
         nominal = float(usd.get("Nominal") or 1)
-        return float(usd["Value"]) / nominal
+        rate = float(usd["Value"]) / nominal
     except (TypeError, KeyError, ValueError, ZeroDivisionError):
         return None
+    if rate > 0:
+        _cbr_cache = (now, rate)
+    return rate or None
 
 
 def fetch_rub(ticker: str, usd: float | None = None) -> tuple[float | None, str]:

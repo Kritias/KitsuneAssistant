@@ -279,7 +279,7 @@ class FoxAssistantCore:
         self.sleep_change_callback = sleep_change_callback  
         self.window_action = window_action_callback  
           
-        self.config = self.load_config()  
+        self.config = self._coerce_config_types(self.load_config())  
         self.lang = {}  
         self.all_chitchat_triggers = {}  
           
@@ -412,7 +412,8 @@ class FoxAssistantCore:
             print(f"  - {line}")
         self.send_to_gui(
             self.t("ui_skills_tag", "🦊 Навыки"),
-            "Одинаковые фразы у разных команд (сработает первая):\n" + "\n".join(f" • {l}" for l in lines),
+            self.t("warn_conflict_header", "Одинаковые фразы у разных команд (сработает первая):")
+            + "\n" + "\n".join(f" • {l}" for l in lines),
         )
 
 
@@ -601,6 +602,7 @@ class FoxAssistantCore:
         self.tts_local_name = ""
         self.tts_local_engine = None
         self._tts_engine_cache = {}
+        self._tts_voice_fingerprint = self._local_voice_fingerprint()
 
         # Токен нужен, чтобы настройки, сохранённые дважды подряд, не гоняли
         # две настройки параллельно: побеждает последняя, ранняя выходит.
@@ -719,6 +721,19 @@ class FoxAssistantCore:
         else:
             order = []
         return order + ["edge-tts", "pyttsx3"]
+
+    def _local_voice_fingerprint(self):
+        """Настройки, от которых зависит голос локального движка.
+
+        Движок кэшируется вместе с голосом, поэтому смена этих настроек должна
+        ронять кэш — иначе переключение Света↔Маша в настройках жило бы до
+        перезапуска приложения.
+        """
+        return (
+            str(self.config.get("silero_speaker", "")),
+            str(self.config.get("kokoro_voice", "")),
+            bool(self.config.get("kokoro_prefer_quantized", False)),
+        )
 
     def _score_candidates(self, text):
         """Возвращает (лучшая команда, её счёт, счёт болталок)."""
@@ -865,17 +880,65 @@ class FoxAssistantCore:
             print(f"[Voice Detection Error]: {e}")  
          
     def load_config(self):  
+        defaults = DEFAULT_CONFIG.copy()
         if os.path.exists(CONFIG_FILE):  
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:  
-                data = json.load(f)  
-                merged = DEFAULT_CONFIG.copy()  
-                merged.update(data)  
-                return merged  
-        return DEFAULT_CONFIG.copy()  
-         
+            try:  
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:  
+                    data = json.load(f)
+            except Exception as e:
+                # Битый конфиг (обрыв записи, чужая правка) не должен ронять
+                # приложение целиком: работаем на умолчаниях и говорим об этом.
+                print(f"[Config] Не читается, использую умолчания: {e}")
+                return defaults
+            if isinstance(data, dict):
+                defaults.update(data)
+            return defaults
+        return defaults  
+
+    @staticmethod
+    def _coerce_config_types(config):
+        """Приводит поля конфига к ожидаемым типам.
+
+        config.json открыт для ручной правки, и строка в числовом поле или
+        None вместо списка сейчас падает уже в рантайме (float("7"), len(None))
+        в местах, далёких от причины. Молча исправляем то, что исправимо.
+        """
+        def _number(key, default, cast=float):
+            try:
+                config[key] = cast(config.get(key))
+            except (TypeError, ValueError):
+                print(f"[Config] {key}: неверное значение {config.get(key)!r}, ставлю {default}")
+                config[key] = default
+
+        _number("wake_timeout", 7.0)
+        _number("asr_cmd_threshold", 70)
+        _number("asr_chitchat_threshold", 70)
+        _number("asr_chitchat_strong", 75)
+        _number("whisper_min_vram_mb", 3000, int)
+        _number("vad_silence_ms", 1000, int)
+        _number("vad_max_utterance_s", 12)
+        if not isinstance(config.get("asr_grammar_extra"), list):
+            config["asr_grammar_extra"] = []
+        if not isinstance(config.get("wake_aliases"), list):
+            config["wake_aliases"] = []
+        config["wake_word"] = str(config.get("wake_word") or "лисичка")
+        config["language"] = str(config.get("language") or "ru")
+        return config
+
     def save_config(self):  
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:  
-            json.dump(self.config, f, ensure_ascii=False, indent=4)  
+        # Запись через временный файл: прерванная прямая запись оставляла бы
+        # битый config.json, который при следующем старте уже не прочитать.
+        tmp = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:  
+                json.dump(self.config, f, ensure_ascii=False, indent=4)
+            os.replace(tmp, CONFIG_FILE)
+        except Exception as e:
+            print(f"[Config] Не удалось сохранить: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
          
     def send_to_gui(self, sender, text):  
         if self.update_gui:  
@@ -1031,7 +1094,18 @@ class FoxAssistantCore:
             self.current_speaking_text = ""
             time.sleep(0.05)
             self.is_speaking = False
+            self._apply_echo_tail()
             self.tts_queue.task_done()
+
+    def _apply_echo_tail(self):
+        """Держит микрофон закрытым ещё MIC_ECHO_TAIL_MS после конца реплики.
+
+        Хвост эха считается от КОНЦА реплики, а не от начала: раньше метка
+        ставилась до синтеза, и у любой фразы длиннее хвоста микрофон
+        открывался ещё звучащим эхом — ассистент слышал собственные слова.
+        """
+        if self.config.get("asr_mute_while_speaking", True):
+            self.mic_resume_at = time.time() + MIC_ECHO_TAIL_MS / 1000.0
 
     def _speak_local(self, engine_name, text):
         """Локальный синтез (Silero или kokoro).
@@ -1040,6 +1114,7 @@ class FoxAssistantCore:
         поднимается в фоне, реплику лучше озвучить через edge-tts, чем
         задерживать ответ.
         """
+        self._sync_local_voice()
         engine = self._tts_engine_cache.get(engine_name)
         if engine is None:
             return False
@@ -1051,6 +1126,18 @@ class FoxAssistantCore:
         audio = tts_local.normalize_peak(audio)
         self._play_audio_array(np.asarray(audio, dtype="float32"), int(sr))
         return True
+
+    def _sync_local_voice(self):
+        """Роняет кэш движков, если в настройках сменился голос.
+
+        Полная реинициализация при смене голоса — слишком дорого (перезагрузка
+        модели), а менять голос без пересоздания движок не умеет. Дешевле
+        сравнить «отпечаток» настроек и пересоздать только затронутый движок.
+        """
+        if self._local_voice_fingerprint() == getattr(self, "_tts_voice_fingerprint", None):
+            return
+        self._tts_voice_fingerprint = self._local_voice_fingerprint()
+        self._tts_engine_cache = {}
 
     def _speak_edge(self, text, pitch_mod, rate_mod):
         """Озвучка через edge-tts. False — нет сети или пришло прерывание."""
@@ -1245,7 +1332,7 @@ class FoxAssistantCore:
                 self.audio_drop_reported = self.audio_dropped_blocks  
                 self.send_to_gui(  
                     self.t("ui_mic_tag"),  
-                    f"Пропущено аудио: {self.audio_dropped_blocks} блоков — распознавание не успевает"  
+                    self.t("warn_audio_dropped", "Пропущено аудио: {count} блоков — распознавание не успевает").format(count=self.audio_dropped_blocks),
                 )  
          
     def _flush_audio_input(self):  
@@ -1257,7 +1344,8 @@ class FoxAssistantCore:
         """  
         if not self.config.get("asr_mute_while_speaking", True):  
             return  
-        self.mic_resume_at = time.time() + MIC_ECHO_TAIL_MS / 1000.0  
+        # Пока is_speaking=True, колбэк микрофона молчит сам; точное время
+        # открытия после реплики ставит _tts_worker_loop, когда звук закончился.
         while not self.audio_queue.empty():  
             try:  
                 self.audio_queue.get_nowait()  
@@ -1469,38 +1557,44 @@ class FoxAssistantCore:
         return None
 
     def _split_slot(self, words, prefix, suffix):
-        """Ищет шаблон во фразе и возвращает хвост — значение слота.
+        """Ищет шаблон во фразе и возвращает (хвост, счёт) или (None, 0).
 
         Шаблон сравнивается скользящим окном в несколько слов, и окно может
-        стоять не в самом начале: «включи саус парк 312» должно разобраться как
+        стоять не в самом начале: «включи саус парк 312» должно разобрать как
         шаблон «саус парк» плюс номер. Значение слота — всегда конец фразы,
-        поэтому окно не доходит до последнего слова.
+        поэтому за окном должно остаться хоть одно слово.
         """
         prefix_words = prefix.split()
         if not prefix_words:
-            return None
+            return None, 0
         base = len(prefix_words)
         best = None  # (счёт, индекс конца шаблона)
         for size in (base, base + 1, base - 1):
-            if size < 1 or size >= len(words):
+            if size < 1:
                 continue
-            for start in range(0, len(words) - size):
+            for start in range(0, len(words) - size + 1):
+                if start + size >= len(words):
+                    continue  # за шаблоном должно остаться значение слота
                 score = fuzz.ratio(" ".join(words[start:start + size]), prefix)
                 if best is None or score > best[0]:
                     best = (score, start + size)
         if best is None or best[0] < SLOT_PREFIX_THRESHOLD:
-            return None
+            return None, 0
 
         tail = words[best[1]:]
         suffix_words = suffix.split()
         if suffix_words:
             if len(tail) <= len(suffix_words):
-                return None
+                return None, 0
             literal = " ".join(tail[-len(suffix_words):])
-            if fuzz.ratio(literal, suffix) < SLOT_PREFIX_THRESHOLD:
-                return None
+            suffix_score = fuzz.ratio(literal, suffix)
+            if suffix_score < SLOT_PREFIX_THRESHOLD:
+                return None, 0
             tail = tail[:-len(suffix_words)]
-        return " ".join(tail).strip() or None
+            # Итоговый скор учитывает обе литеральные части шаблона.
+            best = ((best[0] + suffix_score) / 2, best[1])
+        tail_text = " ".join(tail).strip()
+        return (tail_text or None), best[0]
 
     def _match_slot_command(self, command_text):
         """Ищет команду-шаблон со слотом. Возвращает (имя команды, подстановки).
@@ -1528,15 +1622,16 @@ class FoxAssistantCore:
                 # нормализация съела бы фигурные скобки.
                 prefix = self._normalize_text(phrase[: match.start()])
                 suffix = self._normalize_text(phrase[match.end():])
-                tail = self._split_slot(words, prefix, suffix)
+                tail, match_score = self._split_slot(words, prefix, suffix)
                 if tail is None:
                     continue
                 values = self._parse_slot(slot_name, slots.get(slot_name), tail)
                 if not values:
                     continue
-                score = fuzz.ratio(" ".join(words[:len(prefix.split())]), prefix)
-                if best is None or score > best[0]:
-                    best = (score, cmd_name, values)
+                # Ранжируем по совпадению с тем окном, где шаблон реально нашёлся,
+                # а не с первыми словами фразы: шаблон может стоять в середине.
+                if best is None or match_score > best[0]:
+                    best = (match_score, cmd_name, values)
 
         if best is None:
             return None, {}
@@ -1629,24 +1724,7 @@ class FoxAssistantCore:
             self.execute_scenario(self.commands[slot_cmd].get("steps", []), slot_values)
             return
           
-        best_cmd_score = 0  
-        best_cmd = None  
-        cmd_words_count = len(command_text.split())  
-          
-        for cmd_name, cmd_data in self.commands.items():  
-            phrases = [cmd_name] + cmd_data.get("synonyms", [])  
-            for phrase in phrases:  
-                phrase_words_count = len(self._normalize_text(phrase).split())  
-                score = fuzz.ratio(command_text, self._normalize_text(phrase))  
-                if cmd_words_count >= phrase_words_count:  
-                    partial = fuzz.partial_ratio(self._normalize_text(phrase), command_text)  
-                else:  
-                    partial = 0  
-                  
-                final_score = max(score, partial)  
-                if final_score > best_cmd_score:  
-                    best_cmd_score = final_score  
-                    best_cmd = cmd_name  
+        best_cmd, best_cmd_score, _chat = self._score_candidates(command_text)
           
         if chitchat_score >= float(self.config.get("asr_chitchat_strong", 75)) and chitchat_score >= best_cmd_score:  
             if chitchat_reply == "CAPABILITIES_TRIGGER":  
@@ -1802,9 +1880,12 @@ class FoxAssistantCore:
         print("[Vosk] [unk] в распознанном тексте: словарь не знает этих слов")
         self.send_to_gui(
             self.t("ui_mic_tag"),
-            "Словарь распознавания не знает этих слов — видно по «[unk]». "
-            "Для команд с номером («включи саус парк серия 312») выключи "
-            "asr_grammar в config.json.",
+            self.t(
+                "warn_unk_tokens",
+                "Словарь распознавания не знает этих слов — видно по «[unk]». "
+                "Для команд с номером («включи саус парк серия 312») выключи "
+                "asr_grammar в config.json.",
+            ),
         )
 
     def start_listening(self):

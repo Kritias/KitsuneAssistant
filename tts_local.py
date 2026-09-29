@@ -18,7 +18,6 @@ import json
 import os
 import sys
 import time
-import urllib.request
 import warnings
 
 # ---------------------------------------------------------------------------
@@ -647,6 +646,9 @@ def warmup(engine_name: str, config: dict, directory: str | None = None) -> str:
 CHECK_READY = 0
 CHECK_NEEDS_DOWNLOAD = 10
 CHECK_PACKAGES_MISSING = 11
+#: Silero требует пакеты, которые не ставятся сами: модель без torch не
+#: скачается, поэтому «нет данных» и «нет пакетов» для него не различимы.
+CHECK_UNAVAILABLE = 12
 
 
 def config_models_dir() -> str:
@@ -684,7 +686,11 @@ def check_cli(what: str, prefer_quantized: bool = False) -> int:
     if what == "silero":
         available, reason = silero_available(directory)
         _log(f"silero: {'готов' if available else reason}")
-        return CHECK_READY if available else CHECK_PACKAGES_MISSING
+        if available:
+            return CHECK_READY
+        # «Модель не скачана» и «нет torch» здесь лечатся по-разному, но оба
+        # отличаются от kokoro: скачивание само по себе не поможет.
+        return CHECK_PACKAGES_MISSING if "не установлен" in reason else CHECK_UNAVAILABLE
     _log(f"Неизвестный движок: {what}")
     return CHECK_PACKAGES_MISSING
 
