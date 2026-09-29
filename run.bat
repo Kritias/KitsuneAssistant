@@ -244,6 +244,47 @@ if "%SKIP_TTS%"=="1" (
     echo [2d/3] Silero is up to date.
 )
 
+REM --- 3e. Kokoro's stress model ----------------------------------------------
+REM Kokoro's text frontend fetches its stress model from huggingface.co not at
+REM install time and not into tts_models/, but when the engine is first built,
+REM and keeps it inside its own package. Without it the engine never comes up
+REM and speech silently falls back to edge-tts, which needs the network, so
+REM check it here and offer to fetch it now.
+if "%SKIP_TTS%"=="1" goto kokoro_check_done
+
+"%VENV_PY%" "%~dp0tts_local.py" kokoro --check
+set "KOKORO_STATUS=!errorlevel!"
+
+if "!KOKORO_STATUS!"=="0" (
+    echo [2e/3] Kokoro is ready, stress model included.
+    goto kokoro_check_done
+)
+if "!KOKORO_STATUS!"=="11" (
+    echo [2e/3] Kokoro packages are missing - offline speech is unavailable.
+    echo        Fix it with: run.bat --reinstall
+    goto kokoro_check_done
+)
+
+echo [2e/3] Kokoro needs its stress model ^(~690 MB^) to speak offline.
+echo        Without it speech stays on edge-tts, which needs the network.
+set "KOKORO_ANSWER="
+set /p "KOKORO_ANSWER=        Download it now? [y/N]: "
+if /i not "!KOKORO_ANSWER!"=="y" goto kokoro_check_skip
+
+echo        Downloading, this needs access to huggingface.co...
+"%VENV_PY%" "%~dp0tts_local.py" kokoro
+if errorlevel 1 (
+    echo [WARN] Download failed - speech stays on edge-tts.
+) else (
+    echo        Done: kokoro will speak locally.
+)
+goto kokoro_check_done
+
+:kokoro_check_skip
+echo        Skipped. Later: python tts_local.py kokoro
+
+:kokoro_check_done
+
 if "%SETUP_ONLY%"=="1" (
     echo [3/3] Setup complete. Start the assistant with: run.bat
     exit /b 0

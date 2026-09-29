@@ -643,12 +643,67 @@ def warmup(engine_name: str, config: dict, directory: str | None = None) -> str:
         return f"{engine_name}: ошибка синтеза ({exc})"
 
 
+#: Коды возврата для лаунчеров (``--check``): по ним они решают, что предлагать.
+CHECK_READY = 0
+CHECK_NEEDS_DOWNLOAD = 10
+CHECK_PACKAGES_MISSING = 11
+
+
+def config_models_dir() -> str:
+    """Каталог моделей из config.json, иначе значение по умолчанию.
+
+    Нужен лаунчеру: он работает до приложения, но каталог может быть переопределён
+    в настройках, и проверять надо тот же путь, что использует ассистент.
+    """
+    try:
+        with open(os.path.join(BASE_DIR, "config.json"), encoding="utf-8") as handle:
+            return models_dir(json.load(handle).get("tts_models_dir"))
+    except Exception:
+        return models_dir(None)
+
+
+def check_cli(what: str, prefer_quantized: bool = False) -> int:
+    """Проверка готовности движка для лаунчера: печатает причину, отдаёт код.
+
+    Лаунчеру важно отличить «данные ещё не скачаны — предложи догрузить» от
+    «пакеты не встали — нужен --reinstall». Разбирать для этого текст сообщения
+    было бы хрупко, поэтому ответ идёт кодом возврата.
+    """
+    directory = config_models_dir()
+    if what == "kokoro":
+        for package, human in KOKORO_PACKAGES:
+            if not _can_import(package):
+                _log(f"kokoro: нет пакета {human} — локальная озвучка недоступна")
+                return CHECK_PACKAGES_MISSING
+        available, reason = kokoro_available(directory, prefer_quantized)
+        if available:
+            _log("kokoro: готов, включая модель ударений")
+            return CHECK_READY
+        _log(f"kokoro: {reason}")
+        return CHECK_NEEDS_DOWNLOAD
+    if what == "silero":
+        available, reason = silero_available(directory)
+        _log(f"silero: {'готов' if available else reason}")
+        return CHECK_READY if available else CHECK_PACKAGES_MISSING
+    _log(f"Неизвестный движок: {what}")
+    return CHECK_PACKAGES_MISSING
+
+
 def _download_all_cli() -> int:
-    """Ручная предзагрузка моделей: python tts_local.py [silero|kokoro|all] [--q8]."""
+    """Ручная предзагрузка моделей.
+
+    ``python tts_local.py [silero|kokoro|all] [--q8] [--check]``
+
+    ``--check`` ничего не качает: только сообщает состояние и отдаёт кодом
+    ответ, по которому лаунчер решает, что предлагать пользователю.
+    """
     args = [a.lower() for a in sys.argv[1:]]
     quantized = "--q8" in args
     positional = [a for a in args if not a.startswith("--")]
     what = positional[0] if positional else "all"
+
+    if "--check" in args:
+        return check_cli(what if positional else "kokoro", quantized)
 
     ok = True
     if what in ("silero", "all"):

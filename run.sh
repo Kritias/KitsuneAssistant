@@ -251,6 +251,40 @@ else
     echo "🎙️  Silero недоступен на этом драйвере — говорит kokoro (CPU)."
 fi
 
+# --- 3e. Модель ударений kokoro ---------------------------------------------
+# Текстовый фронтенд kokoro тянет свою модель ударений с huggingface.co не при
+# установке пакетов и не в tts_models/, а в момент построения движка, и держит
+# её внутри своего пакета. Без неё движок не поднимется, а озвучка молча уйдёт
+# на edge-tts, которому нужна сеть. Проверяем и предлагаем догрузить заранее.
+if [ "$SKIP_TTS" -eq 1 ]; then
+    echo "🗣️  Проверка kokoro пропущена флагом --no-tts."
+else
+    "$VENV_PY" "$PROJECT_DIR/tts_local.py" kokoro --check
+    KOKORO_STATUS=$?
+
+    if [ "$KOKORO_STATUS" -eq 0 ]; then
+        echo "🗣️  Kokoro готов, модель ударений на месте."
+    elif [ "$KOKORO_STATUS" -eq 11 ]; then
+        echo "⚠️  Пакеты kokoro не установлены — локальная озвучка недоступна."
+        echo "   Починить: ./run.sh --reinstall"
+    else
+        echo "🗣️  Kokoro нужна модель ударений (~690 МБ), иначе он не заговорит."
+        echo "   Без неё озвучка идёт через edge-tts, а ему нужна сеть."
+        KOKORO_ANSWER=""
+        read -r -p "   Скачать сейчас? [y/N]: " KOKORO_ANSWER || KOKORO_ANSWER=""
+        if [ "$KOKORO_ANSWER" = "y" ] || [ "$KOKORO_ANSWER" = "Y" ]; then
+            echo "   Качаю, нужен доступ к huggingface.co..."
+            if "$VENV_PY" "$PROJECT_DIR/tts_local.py" kokoro; then
+                echo "   Готово: kokoro будет говорить локально."
+            else
+                echo "⚠️  Скачать не удалось — озвучка останется на edge-tts."
+            fi
+        else
+            echo "   Пропускаю. Позже: python tts_local.py kokoro"
+        fi
+    fi
+fi
+
 if [ "$SETUP_ONLY" -eq 1 ]; then
     echo "🚀 Установка завершена. Запуск ассистента: ./run.sh"
     exit 0
