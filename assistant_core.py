@@ -33,6 +33,12 @@ except Exception as _asr_import_error:  # модуль опционален: б�
     asr_whisper = None
     print(f"[ASR] Модуль asr_whisper недоступен: {_asr_import_error}")
 
+try:
+    import tts_local
+except Exception as _tts_import_error:  # модуль опционален: без него edge-tts и SAPI
+    tts_local = None
+    print(f"[TTS] Модуль tts_local недоступен: {_tts_import_error}")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COMMANDS_DIR = os.path.join(BASE_DIR, "commands")
@@ -53,11 +59,18 @@ DEFAULT_CONFIG = {
     ],  
     "require_wake_word": True,  
     "wake_timeout": 7.0,  
-    "tts_engine": "edge-tts",  
+    # auto: сначала локальный синтез (Silero/kokoro), затем edge-tts и SAPI.
+    "tts_engine": "auto",  
     "tts_voice": "ru-RU-SvetlanaNeural",
     "tts_rate": 190,
     "tts_pitch": "+10Hz",
     "tts_rate_edge": "+15%",
+    "tts_models_dir": "tts_models",
+    "silero_speaker": "",
+    "kokoro_voice": "sveta",
+    # true — лёгкая q8-модель kokoro (138 МБ) вместо fp32 (326 МБ): меньше диск,
+    # но на CPU примерно вчетверо медленнее.
+    "kokoro_prefer_quantized": False,
     "icon_path": "",  
     "avatar_path": "",  
     "icon_sleep_5min": "",  
@@ -186,6 +199,7 @@ class FoxAssistantCore:
             self.recognizer = None  
             self.rebuild_recognizer()  
         self._init_asr_engine()  
+        self._init_tts_engine()  
          
     def load_lang_command_file(self, lang_code):  
         os.makedirs(COMMANDS_DIR, exist_ok=True)  
@@ -383,6 +397,150 @@ class FoxAssistantCore:
         self.asr_engine = "vosk"
         self.whisper = None
         self.whisper_reason = "Vosk (CPU)"
+
+    def _log_tts(self, message):
+        """Единая точка логирования выбора и работы движка синтеза."""
+        print(f"[TTS] {message}")
+        try:
+            self.send_to_gui(self.t("ui_voice_tag"), message)
+        except Exception:
+            pass
+
+    def tts_models_dir(self):
+        """Каталог локальных моделей синтеза из конфига."""
+        if tts_local is None:
+            return ""
+        return tts_local.models_dir(self.config.get("tts_models_dir"))
+
+    def _init_tts_engine(self):
+        """Перенастраивает локальный синтез речи в фоне.
+
+        Выбор движка требует импорта torch (чтобы понять, жива ли CUDA), а это
+        секунды на Windows. Держать из-за этого окно приложения нельзя, поэтому
+        сброс состояния делается сразу, а сама проба уходит в отдельный поток:
+        пока он работает, озвучка идёт через edge-tts.
+        """
+        self.tts_local_name = ""
+        self.tts_local_engine = None
+        self._tts_engine_cache = {}
+
+        # Токен нужен, чтобы настройки, сохранённые дважды подряд, не гоняли
+        # две настройки параллельно: побеждает последняя, ранняя выходит.
+        self._tts_setup_token = getattr(self, "_tts_setup_token", 0) + 1
+        token = self._tts_setup_token
+        threading.Thread(target=self._select_tts_engine, args=(token,), daemon=True).start()
+
+    def _tts_setup_is_current(self, token):
+        return token == self._tts_setup_token
+
+    def _select_tts_engine(self, token):
+        """Основной поток: ручной выбор → Silero (torch + CUDA) → kokoro (ONNX).
+
+        Если недоступно ничего, озвучка остаётся сетевой: edge-tts, затем SAPI5.
+        """
+        if tts_local is None:
+            self._log_tts("Модуль локального синтеза недоступен — работаю через edge-tts")
+            return
+
+        name, reason = tts_local.choose_engine(self.config, self.tts_models_dir())
+        if not self._tts_setup_is_current(token):
+            return
+
+        # Модели, которых ещё нет, догружаем в фоне даже когда говорить прямо
+        # сейчас может другой движок. Иначе на машине с CUDA Silero не появился
+        # бы никогда: kokoro уже готов, и выбор всегда останавливался бы на нём.
+        pending = tts_local.downloadable_engines(self.config, self.tts_models_dir())
+
+        if name:
+            self.tts_local_name = name
+            self._log_tts(f"Локальный синтез: {name} — гружу модель в фоне")
+            threading.Thread(
+                target=self._preload_tts_engine, args=(name, token), daemon=True
+            ).start()
+        elif not pending:
+            self._log_tts(f"Локальный синтез недоступен ({reason}) — работаю через edge-tts")
+            return
+
+        if pending:
+            self._log_tts(f"Догружаю модели в фоне: {', '.join(pending)}")
+            threading.Thread(
+                target=self._prepare_tts_models, args=(pending, token), daemon=True
+            ).start()
+
+    def _prepare_tts_models(self, engines, token):
+        """Разовая загрузка моделей. Любой сбой просто оставляет edge-tts."""
+        loaded = False
+        try:
+            if "silero" in engines:
+                loaded = tts_local.download_silero(
+                    self.tts_models_dir(), progress=self._log_tts
+                ) or loaded
+            if "kokoro" in engines:
+                loaded = tts_local.download_kokoro(
+                    self.tts_models_dir(),
+                    progress=self._log_tts,
+                    prefer_quantized=bool(self.config.get("kokoro_prefer_quantized", False)),
+                ) or loaded
+        except Exception as exc:
+            self._log_tts(f"Загрузка моделей не удалась: {exc}")
+
+        if not self._tts_setup_is_current(token):
+            return
+
+        if loaded:
+            self._select_tts_engine(token)
+        else:
+            self._log_tts("Модели загрузить не удалось — озвучка через edge-tts")
+
+    def _preload_tts_engine(self, name, token):
+        """Загружает модель в фоне, чтобы не задерживать появление окна."""
+        engine = self._local_engine(name, token)
+        if not self._tts_setup_is_current(token):
+            return
+        if engine is None:
+            self._log_tts(f"{name} не запустился — перехожу на edge-tts")
+            self.tts_local_name = ""
+            return
+        device = getattr(engine, "device_name", "") or "CPU"
+        voice = getattr(engine, "speaker", "") or getattr(engine, "voice", "")
+        self._log_tts(f"Локальный синтез готов: {name}, {device}, голос {voice or 'по умолчанию'}")
+
+    def _local_engine(self, name, token=None):
+        """Ленивое создание движка с кэшированием, включая неудачные попытки."""
+        if tts_local is None:
+            return None
+        if name not in self._tts_engine_cache:
+            engine = tts_local.create_engine(name, self.config, self.tts_models_dir())
+            if token is not None and not self._tts_setup_is_current(token):
+                # Настройки успели смениться, пока модель поднималась. Возвращать
+                # движок нельзя, и класть его в уже очищенный кэш тоже: иначе
+                # старая озвучка воскреснет в новом наборе настроек.
+                return None
+            self._tts_engine_cache[name] = engine
+        return self._tts_engine_cache[name]
+
+    def _tts_engine_order(self):
+        """Очередь движков: локальный → edge-tts → SAPI5.
+
+        Пока модель грузится в фоне, локальный движок вернёт None, и озвучка
+        сразу уйдёт на edge-tts, а после загрузки начнёт работать локально.
+        """
+        want = str(self.config.get("tts_engine", "auto")).lower()
+        if want == "pyttsx3":
+            return ["pyttsx3"]
+        if want == "edge-tts":
+            return ["edge-tts", "pyttsx3"]
+
+        if want == "silero":
+            order = ["silero", "kokoro"]
+        elif want == "kokoro":
+            order = ["kokoro", "silero"]
+        elif self.tts_local_name:
+            order = [self.tts_local_name]
+            order.append("kokoro" if self.tts_local_name == "silero" else "silero")
+        else:
+            order = []
+        return order + ["edge-tts", "pyttsx3"]
 
     def _score_candidates(self, text):
         """Возвращает (лучшая команда, её счёт, счёт болталок)."""
@@ -654,95 +812,131 @@ class FoxAssistantCore:
             except Exception:  
                 pass  
          
-    def _tts_worker_loop(self):  
-        while True:  
-            text = self.tts_queue.get()  
-            self.stop_speech_event.clear()  
-            self.is_speaking = True  
-            self.current_speaking_text = text  
-             
-            played_successfully = False  
-            tts_engine_type = self.config.get("tts_engine", "edge-tts")  
-            voice_name = self.config.get("tts_voice", "ru-RU-SvetlanaNeural")  
+    def _tts_worker_loop(self):
+        while True:
+            text = self.tts_queue.get()
+            self.stop_speech_event.clear()
+            self.is_speaking = True
+            self.current_speaking_text = text
+
             pitch_mod = self.config.get("tts_pitch", "+0Hz")
             rate_mod = self.config.get("tts_rate_edge", "+10%")
-             
-            if self.stop_speech_event.is_set():  
-                self.is_speaking = False  
-                self.tts_queue.task_done()  
-                continue  
-             
-            if tts_engine_type == "edge-tts":  
-                try:  
-                    audio_bytes = asyncio.run(self._async_generate_edge_tts(text, voice_name, pitch=pitch_mod, rate=rate_mod))  
-                    if self.stop_speech_event.is_set():  
-                        self.is_speaking = False  
-                        self.tts_queue.task_done()  
-                        continue  
-                      
-                    if audio_bytes and len(audio_bytes) > 100:  
-                        with io.BytesIO(audio_bytes) as bio:  
-                            data, sr = sf.read(bio, dtype="float32")  
-                            if data.ndim > 1:  
-                                data = data[:, 0]  
-                            self._play_audio_array(data, sr)  
-                            played_successfully = True  
-                except Exception as e:  
-                    print(f"[Edge-TTS Fallback]: {e}")  
-                    self.send_to_gui("⚠️ Sound", self.t("ui_network_fallback"))  
-             
-            if not played_successfully and not self.stop_speech_event.is_set():  
-                temp_wav = os.path.join(tempfile.gettempdir(), f"fox_{os.getpid()}_{int(time.time()*1000)}.wav")  
-                try:  
-                    def _render_sapi():  
-                        try:  
-                            ctypes.windll.ole32.CoInitialize(None)  
-                            engine = pyttsx3.init()  
-                            engine.setProperty("rate", self.config.get("tts_rate", 190))  
-                            engine.setProperty("volume", 1.0)  
-                              
-                            lang = self.config.get("language", "ru")  
-                            chosen_sapi = self.sapi_voices.get(lang) or self.sapi_voices.get("ru") or self.sapi_voices.get("en")  
-                            if chosen_sapi:  
-                                engine.setProperty("voice", chosen_sapi)  
-                              
-                            engine.save_to_file(text, temp_wav)  
-                            engine.runAndWait()  
-                            engine.stop()  
-                        finally:  
-                            try:  
-                                ctypes.windll.ole32.CoUninitialize()  
-                            except Exception:  
-                                pass  
-                     
-                    t = threading.Thread(target=_render_sapi, daemon=True)  
-                    t.start()  
-                    t.join(timeout=10.0)  
-                     
-                    if not self.stop_speech_event.is_set() and os.path.exists(temp_wav) and os.path.getsize(temp_wav) > 44:  
-                        with wave.open(temp_wav, "rb") as wf:  
-                            sr = wf.getframerate()  
-                            ch = wf.getnchannels()  
-                            raw = wf.readframes(wf.getnframes())  
-                          
-                        arr = np.frombuffer(raw, dtype=np.int16)  
-                        if ch > 1:  
-                            arr = arr.reshape(-1, ch)[:, 0]  
-                        data = arr.astype(np.float32) / 32768.0  
-                        self._play_audio_array(data, sr)  
-                        try:  
-                            os.remove(temp_wav)  
-                        except Exception:  
-                            pass  
-                except Exception as err:  
-                    print(f"[SAPI5 Error]: {err}")  
-             
-            self.latest_spectrum = [0.0] * self.num_bands  
-            self.current_speaking_text = ""  
-            time.sleep(0.05)  
-            self.is_speaking = False  
-            self.tts_queue.task_done()  
-         
+            played_successfully = False
+
+            for engine_name in self._tts_engine_order():
+                if self.stop_speech_event.is_set():
+                    break
+                try:
+                    if engine_name in ("silero", "kokoro"):
+                        played_successfully = self._speak_local(engine_name, text)
+                    elif engine_name == "edge-tts":
+                        played_successfully = self._speak_edge(text, pitch_mod, rate_mod)
+                    elif engine_name == "pyttsx3":
+                        played_successfully = self._speak_sapi(text)
+                except Exception as err:
+                    print(f"[TTS {engine_name}]: {err}")
+                    played_successfully = False
+                if played_successfully:
+                    break
+
+            self.latest_spectrum = [0.0] * self.num_bands
+            self.current_speaking_text = ""
+            time.sleep(0.05)
+            self.is_speaking = False
+            self.tts_queue.task_done()
+
+    def _speak_local(self, engine_name, text):
+        """Локальный синтез (Silero или kokoro).
+
+        Берём только уже загруженный движок: пока модель качается или
+        поднимается в фоне, реплику лучше озвучить через edge-tts, чем
+        задерживать ответ.
+        """
+        engine = self._tts_engine_cache.get(engine_name)
+        if engine is None:
+            return False
+        audio, sr = engine.synthesize(text)
+        if self.stop_speech_event.is_set() or audio is None or len(audio) == 0:
+            return False
+        # Громкость выравнивается по пику: движки отдают её очень по-разному,
+        # и без этого смена голоса слышалась бы как скачок громкости.
+        audio = tts_local.normalize_peak(audio)
+        self._play_audio_array(np.asarray(audio, dtype="float32"), int(sr))
+        return True
+
+    def _speak_edge(self, text, pitch_mod, rate_mod):
+        """Озвучка через edge-tts. False — нет сети или пришло прерывание."""
+        voice_name = self.config.get("tts_voice", "ru-RU-SvetlanaNeural")
+        try:
+            audio_bytes = asyncio.run(
+                self._async_generate_edge_tts(text, voice_name, pitch=pitch_mod, rate=rate_mod)
+            )
+        except Exception as e:
+            print(f"[Edge-TTS Fallback]: {e}")
+            self.send_to_gui("⚠️ Sound", self.t("ui_network_fallback"))
+            return False
+
+        if self.stop_speech_event.is_set():
+            return False
+        if audio_bytes and len(audio_bytes) > 100:
+            with io.BytesIO(audio_bytes) as bio:
+                data, sr = sf.read(bio, dtype="float32")
+                if data.ndim > 1:
+                    data = data[:, 0]
+                self._play_audio_array(data, sr)
+                return True
+        return False
+
+    def _speak_sapi(self, text):
+        """Последний фолбэк: системный голос Windows через SAPI5."""
+        temp_wav = os.path.join(tempfile.gettempdir(), f"fox_{os.getpid()}_{int(time.time()*1000)}.wav")
+
+        def _render_sapi():
+            try:
+                ctypes.windll.ole32.CoInitialize(None)
+                engine = pyttsx3.init()
+                engine.setProperty("rate", self.config.get("tts_rate", 190))
+                engine.setProperty("volume", 1.0)
+
+                lang = self.config.get("language", "ru")
+                chosen_sapi = self.sapi_voices.get(lang) or self.sapi_voices.get("ru") or self.sapi_voices.get("en")
+                if chosen_sapi:
+                    engine.setProperty("voice", chosen_sapi)
+
+                engine.save_to_file(text, temp_wav)
+                engine.runAndWait()
+                engine.stop()
+            finally:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+        try:
+            t = threading.Thread(target=_render_sapi, daemon=True)
+            t.start()
+            t.join(timeout=10.0)
+
+            if not self.stop_speech_event.is_set() and os.path.exists(temp_wav) and os.path.getsize(temp_wav) > 44:
+                with wave.open(temp_wav, "rb") as wf:
+                    sr = wf.getframerate()
+                    ch = wf.getnchannels()
+                    raw = wf.readframes(wf.getnframes())
+
+                arr = np.frombuffer(raw, dtype=np.int16)
+                if ch > 1:
+                    arr = arr.reshape(-1, ch)[:, 0]
+                data = arr.astype(np.float32) / 32768.0
+                self._play_audio_array(data, sr)
+                try:
+                    os.remove(temp_wav)
+                except Exception:
+                    pass
+                return True
+        except Exception as err:
+            print(f"[SAPI5 Error]: {err}")
+        return False
+
     def speak(self, text):  
         speaker_label = self.t("ui_speaker_name", "🦊 Лисичка")  
         self.send_to_gui(speaker_label, text)  

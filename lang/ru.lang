@@ -78,6 +78,9 @@
     "voice_ru_kitsune": "🦊 Кицунэ (Аниме-вайб)",
     "voice_ru_kawaii": "🌸 Кавай-тян (Высокий питч)",
     "voice_ru_svetlana": "🎙️ Светлана (Классика)",
+    "voice_ru_auto": "🎛️ Авто (локальный → сеть → SAPI)",
+    "voice_ru_silero": "🔊 Silero (офлайн, лучшее качество)",
+    "voice_ru_kokoro": "🦊 kokoro (офлайн, лёгкий)",
     "voice_sapi": "💻 Системный (SAPI5 / Офлайн)",
     "ui_speaker_name": "🦊 Лисичка",
     "ui_user_name": "Вы",
@@ -96,6 +99,7 @@
     "ui_screenshot_tag": "🐾 След",
     "ui_skills_tag": "🦊 Навыки",
     "ui_mic_tag": "🎙️ Микрофон",
+    "ui_voice_tag": "🔊 Голос",
     "actions": {
         "get_power_mode": "⚡ Проверить режим питания (get_power_mode)",
         "show_full_window": "🌟 Вылезти на весь экран (show_full_window)",

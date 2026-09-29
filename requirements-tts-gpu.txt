@@ -1,0 +1,36 @@
+# Локальный синтез речи, лучший путь (движок Silero TTS v5 на PyTorch + CUDA).
+#
+# Ставится только когда в системе есть NVIDIA. Занимает несколько гигабайт
+# и тянет CUDA-рантайм, поэтому без видеокарты смысла в этом файле нет:
+# assistant_core тогда выбирает kokoro из requirements-tts.txt.
+#
+# torch берётся из индекса PyTorch, а не с PyPI: на PyPI лежит CPU-сборка,
+# и именно из-за неё torch.cuda.is_available() возвращает False даже при
+# живой видеокарте. Дополнительный индекс PyPI нужен для зависимостей
+# самой сборки (sympy, filelock, jinja2 и прочего), которых нет на
+# download.pytorch.org.
+#
+# Метка cu126 выбрана как база: она поддерживает Ampere (RTX 30xx, sm_86)
+# и требует драйвер NVIDIA не старше CUDA 12.6. Если у вас другая карта или
+# драйвер, замените cu126 на подходящую метку из списка
+#     https://download.pytorch.org/whl/torch/
+# (доступны cu118, cu121, cu124, cu126, cu128, cu129, cu130, cu132).
+#
+# Установка вручную:
+#     .venv\Scripts\python.exe -m pip install -r requirements-tts-gpu.txt
+#     .venv\Scripts\python.exe tts_local.py silero     # скачать модель
+
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch>=2.2.0
+
+# Сам код модели Silero v5 внутри .pt использует scipy (ресемплинг и эквалайзер),
+# поэтому без него движок не поднимется: torch.package распаковывает модель,
+# а её apply_tts упирается в ImportError.
+scipy>=1.10.0
+
+# Пакет silero в рантайме не используется — модель грузится прямо из .pt через
+# torch.package. Оставлен ради CLI и диагностики, стоит копейки рядом с torch.
+silero>=0.5.5
+omegaconf>=2.3.0

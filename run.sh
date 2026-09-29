@@ -12,6 +12,7 @@
 #    ./run.sh --setup       только создать venv и установить зависимости
 #    ./run.sh --foreground  запустить с консолью (видны логи Vosk и ошибки)
 #    ./run.sh --reinstall   переустановить зависимости с нуля
+#    ./run.sh --no-tts      пропустить локальный синтез речи (только сеть)
 #    ./run.sh --help        эта справка
 #
 #  Окружение: Windows (Git Bash / MSYS2 / Cygwin) или Linux/macOS.
@@ -32,9 +33,10 @@ ENTRYPOINT="$PROJECT_DIR/main.py"
 SETUP_ONLY=0
 FOREGROUND=0
 REINSTALL=0
+SKIP_TTS=0
 
 print_help() {
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'
+    sed -n '2,22p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
@@ -42,6 +44,7 @@ for arg in "$@"; do
         --setup|--install|-s)   SETUP_ONLY=1 ;;
         --foreground|--debug|-f) FOREGROUND=1 ;;
         --reinstall|--force)    REINSTALL=1 ;;
+        --no-tts)               SKIP_TTS=1 ;;
         -h|--help)              print_help; exit 0 ;;
         *)
             echo "❌ Неизвестный аргумент: $arg" >&2
@@ -141,6 +144,111 @@ if [ -f "$GPU_REQ_FILE" ] && has_nvidia; then
     else
         echo "🎮 GPU-зависимости распознавания актуальны."
     fi
+fi
+
+# --- 3c. Локальный синтез речи: лёгкий путь (kokoro, ONNX) ------------------
+# Ставится на любой машине: работает на CPU и делает озвучку офлайн.
+# Сбой установки не критичен — ассистент просто продолжит говорить через
+# edge-tts, а затем через SAPI5, как и до появления локального синтеза.
+TTS_REQ_FILE="$PROJECT_DIR/requirements-tts.txt"
+TTS_LOCK_FILE="$VENV_DIR/.requirements-tts.lock"
+
+if [ "$SKIP_TTS" -eq 0 ] && [ -f "$TTS_REQ_FILE" ]; then
+    TTS_NEED=0
+    if [ "$REINSTALL" -eq 1 ]; then
+        TTS_NEED=1
+    elif [ ! -f "$TTS_LOCK_FILE" ] || ! cmp -s "$TTS_REQ_FILE" "$TTS_LOCK_FILE"; then
+        TTS_NEED=1
+    fi
+    if [ "$TTS_NEED" -eq 1 ]; then
+        echo "🗣️  Ставлю локальный синтез речи (kokoro, ~0.4 ГБ)..."
+        if "$VENV_PY" -m pip install -r "$TTS_REQ_FILE"; then
+            cp "$TTS_REQ_FILE" "$TTS_LOCK_FILE"
+            echo "✅ Локальный синтез готов."
+        else
+            echo "⚠️  Локальный синтез не встал — озвучка останется сетевой (edge-tts)."
+        fi
+    else
+        echo "🗣️  Локальный синтез актуален."
+    fi
+elif [ "$SKIP_TTS" -eq 1 ]; then
+    echo "🗣️  Локальный синтез пропущен флагом --no-tts."
+fi
+
+# --- 3d. Локальный синтез речи: лучший путь (Silero на PyTorch + CUDA) ------
+# Нужен только при живой NVIDIA: torch с CUDA-рантаймом занимает гигабайты,
+# а CPU-сборка с PyPI — причина, по которой torch.cuda.is_available() даёт
+# False даже на исправной видеокарте. Поэтому проверка по возможности, а не
+# по факту «torch установлен»: CPU-сборка считается требующей замены.
+# Файл-маркер не даёт перекачивать гигабайты при каждом запуске, если
+# установка прошла, а драйвер оказался слишком старым.
+TTS_GPU_REQ_FILE="$PROJECT_DIR/requirements-tts-gpu.txt"
+TTS_GPU_LOCK_FILE="$VENV_DIR/.requirements-tts-gpu.lock"
+CUDA_MARKER="$VENV_DIR/.tts-cuda-unavailable"
+# Должны совпадать с --index-url / --extra-index-url в requirements-tts-gpu.txt.
+TORCH_CUDA_INDEX="https://download.pytorch.org/whl/cu126"
+PYPI_INDEX="https://pypi.org/simple"
+
+cuda_available() {
+    "$VENV_PY" -c 'import torch,sys;sys.exit(0 if torch.cuda.is_available() else 1)' \
+        >/dev/null 2>&1
+}
+
+if [ "$REINSTALL" -eq 1 ]; then
+    rm -f "$CUDA_MARKER"
+fi
+
+CUDA_READY=0
+cuda_available && CUDA_READY=1
+
+if [ "$SKIP_TTS" -eq 0 ] && has_nvidia && [ -f "$TTS_GPU_REQ_FILE" ]; then
+    TTS_GPU_NEED=0
+    if [ ! -f "$TTS_GPU_LOCK_FILE" ] || ! cmp -s "$TTS_GPU_REQ_FILE" "$TTS_GPU_LOCK_FILE"; then
+        TTS_GPU_NEED=1
+    fi
+    if [ "$CUDA_READY" -eq 0 ] && [ ! -f "$CUDA_MARKER" ]; then
+        TTS_GPU_NEED=1
+    fi
+
+    if [ "$TTS_GPU_NEED" -eq 1 ]; then
+        echo "🎙️  Найдена NVIDIA — ставлю Silero на CUDA (несколько ГБ, долго)..."
+        FAILED=0
+        if [ "$CUDA_READY" -eq 0 ]; then
+            # Именно здесь нужен --force-reinstall: на PyPI лежит CPU-сборка с той
+            # же версией, и без него pip решит, что torch уже стоит.
+            # Переустанавливаем только torch, чтобы правка requirements-tts-gpu.txt
+            # не тянула 2.6 ГБ колёса заново и не дёргала numpy, setuptools и прочее.
+            "$VENV_PY" -m pip install --upgrade --force-reinstall \
+                --index-url "$TORCH_CUDA_INDEX" --extra-index-url "$PYPI_INDEX" torch || FAILED=1
+        fi
+        if [ "$FAILED" -eq 0 ]; then
+            "$VENV_PY" -m pip install -r "$TTS_GPU_REQ_FILE" || FAILED=1
+        fi
+
+        if [ "$FAILED" -ne 0 ]; then
+            echo "⚠️  Silero не встал — говорить будет kokoro (CPU)."
+            : > "$CUDA_MARKER"
+        else
+            cp "$TTS_GPU_REQ_FILE" "$TTS_GPU_LOCK_FILE"
+            if cuda_available; then
+                rm -f "$CUDA_MARKER"
+                echo "✅ Silero готов."
+            else
+                echo "⚠️  torch установлен, но CUDA недоступна (старый драйвер?)."
+                echo "   Речь пойдёт через kokoro на CPU. Обнови драйвер NVIDIA и удали"
+                echo "   $CUDA_MARKER, чтобы включить Silero."
+                : > "$CUDA_MARKER"
+            fi
+        fi
+    else
+        echo "🎙️  Silero актуален."
+    fi
+elif [ "$SKIP_TTS" -eq 1 ]; then
+    echo "🎙️  Silero пропущен флагом --no-tts."
+elif ! has_nvidia; then
+    echo "🎙️  NVIDIA не найдена — Silero не нужен, говорит kokoro (CPU)."
+else
+    echo "🎙️  Silero недоступен на этом драйвере — говорит kokoro (CPU)."
 fi
 
 if [ "$SETUP_ONLY" -eq 1 ]; then

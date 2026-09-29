@@ -78,6 +78,9 @@
     "voice_en_kitsune": "🦊 Kitsune (High Anime Tone)",
     "voice_en_ana": "👧 Ana (Cute / Sweet)",
     "voice_en_aria": "✨ Aria (Warm / Natural)",
+    "voice_ru_silero": "🔊 Silero (offline, best quality)",
+    "voice_ru_auto": "🎛️ Auto (local → network → SAPI)",
+    "voice_ru_kokoro": "🦊 kokoro (offline, lightweight)",
     "voice_sapi": "💻 System Voice (SAPI5 / Offline)",
     "ui_speaker_name": "🦊 Kitsune",
     "ui_user_name": "You",
@@ -96,6 +99,7 @@
     "ui_screenshot_tag": "🐾 Trace",
     "ui_skills_tag": "🦊 Skills",
     "ui_mic_tag": "🎙️ Microphone",
+    "ui_voice_tag": "🔊 Voice",
     "actions": {
         "get_power_mode": "⚡ Check Power Mode (get_power_mode)",
         "show_full_window": "🌟 Emerge into Full Screen (show_full_window)",
