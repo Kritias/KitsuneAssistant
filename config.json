@@ -1,0 +1,27 @@
+{
+    "wake_word": "лисичка",
+    "wake_aliases": [
+        "лисичка",
+        "лиса",
+        "лисица",
+        "лисички",
+        "кицунэ",
+        "рыжая",
+        "fox",
+        "kitsune",
+        "foxie"
+    ],
+    "require_wake_word": true,
+    "wake_timeout": 7.0,
+    "tts_engine": "edge-tts",
+    "tts_voice": "ru-RU-DariyaNeural",
+    "tts_rate": 190,
+    "tts_pitch": "+4Hz",
+    "tts_rate_edge": "+3%",
+    "icon_path": "resources/icon.png",
+    "avatar_path": "resources/fox_avatar.png",
+    "icon_sleep_5min": "resources/icon_5min.png",
+    "icon_sleep_never": "resources/icon_never.png",
+    "language": "ru",
+    "microphone": ""
+}

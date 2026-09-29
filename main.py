@@ -1,0 +1,1478 @@
+import os
+import sys
+import math
+import time
+import json
+import random
+import threading
+import tkinter as tk
+import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
+import pystray
+from pystray import MenuItem as item
+import numpy as np
+
+from assistant_core import FoxAssistantCore, MARKER_FILE, load_language_dict
+
+# --- Киберпанк-палитра KITSUNE ---
+HUD_THEME = {
+    "chassis_dark": "#05070A",
+    "chassis_panel": "#0B0F16",
+    "panel_card": "#111722",
+    "panel_inner": "#080B10",
+    "panel_border": "#1D2636",
+    "panel_border_light": "#364154",
+    "panel_border_glow": "#FF8C00",
+    "panel_cyan_glow": "#00F0FF",
+    
+    # Неоновые языки пламени
+    "flame_core": "#FFFFFF",
+    "flame_hot": "#FFF0A5",
+    "flame_gold": "#FFB703",
+    "flame_amber": "#FB8500",
+    "flame_crimson": "#D90429",
+    "flame_glow": "#FF4500",
+    "flame_smoke": "#450A14",
+    
+    "hud_cyan": "#00F0FF",
+    "hud_cyan_dim": "#0E3846",
+    "hud_green": "#00FF9D",
+    "spirit_shield": "#C084FC",
+    
+    "text_bright": "#F8FAFC",
+    "text_dim": "#7D8FA9",
+    "text_dark": "#182232"
+}
+
+NUM_BANDS = 28
+
+LANG_OPTIONS = {
+    "🇷🇺 Русский (RU)": "ru",
+    "🇬🇧 English (EN)": "en"
+}
+
+ctk.set_appearance_mode("Dark")
+
+def resource_path(relative_path):
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    res_path = os.path.join(base_path, "resources", relative_path)
+    if os.path.exists(res_path):
+        return res_path
+    return os.path.join(base_path, relative_path)
+
+def create_default_fox_icon():
+    img = Image.new("RGBA", (64, 64), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.polygon([(8, 20), (56, 20), (32, 60)], fill="#FB8500")
+    draw.polygon([(8, 20), (20, 4), (28, 20)], fill="#FFB703")
+    draw.polygon([(56, 20), (44, 4), (36, 20)], fill="#FFB703")
+    draw.ellipse([(28, 48), (36, 56)], fill="#05070A")
+    return img
+
+def create_fallback_sun_icon():
+    img = Image.new("RGBA", (64, 64), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([(18, 18), (46, 46)], fill="#FFB703")
+    return img
+
+def create_fallback_moon_icon():
+    img = Image.new("RGBA", (64, 64), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([(14, 14), (50, 50)], fill="#00F2FE")
+    draw.ellipse([(24, 10), (56, 46)], fill=(0, 0, 0, 0))
+    return img
+
+class FoxAssistantApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self.configure(fg_color=HUD_THEME["chassis_dark"])
+        
+        self.core = FoxAssistantCore(
+            update_gui_callback=self.update_chat,
+            status_callback=self.update_status_badge,
+            sleep_change_callback=self.on_sleep_mode_changed,
+            window_action_callback=self.handle_window_action
+        )
+
+        self.cur_lang = self.core.config.get("language", "ru")
+        self.lang = load_language_dict(self.cur_lang)
+        self.title(self.t("app_title"))
+        
+        self.current_window_mode = "mini"
+        self.current_screen = "chat"
+        
+        self.flame_time = 0.0
+        self.rot_ring_inner = 0.0
+        self.rot_ring_outer = 0.0
+        self.scanline_y = 0.0
+        self.smooth_heat = 0.0
+        self.smooth_spectrum = [0.0] * NUM_BANDS
+
+        self.current_editing_cmd = None
+        self.step_rows = []
+
+        self.load_sleep_icons()
+        self.current_pil_icon = self.load_application_icon()
+        self.apply_window_icon()
+        self.load_fox_avatar()
+
+        self.setup_actions_and_voices()
+
+        self.tray_icon = None
+        self.sleep_tray = None
+        self.init_main_system_tray()
+        self.init_sleep_system_tray()
+
+        self.setup_ui()
+        self.set_window_mode("mini")
+        
+        self.animate_hud()
+        self.after(500, self.auto_start_listening)
+
+    def t(self, key, default=""):
+        return self.lang.get(key, default if default else key)
+
+    def get_available_input_devices(self):
+        devices = []
+        try:
+            import sounddevice as sd
+            devs = sd.query_devices()
+            for idx, dev in enumerate(devs):
+                if dev['max_input_channels'] > 0:
+                    devices.append((idx, dev['name']))
+        except Exception:
+            pass
+        return devices
+
+    def setup_actions_and_voices(self):
+        act_map = self.lang.get("actions", {})
+        self.actions_dict = {
+            act_map.get("get_power_mode", "get_power_mode"): "get_power_mode",
+            act_map.get("show_full_window", "show_full_window"): "show_full_window",
+            act_map.get("show_mini_window", "show_mini_window"): "show_mini_window",
+            act_map.get("hide_to_tray", "hide_to_tray"): "hide_to_tray",
+            act_map.get("list_commands", "list_commands"): "list_commands",
+            act_map.get("fullscreen", "fullscreen"): "fullscreen",
+            act_map.get("lock_keyboard", "lock_keyboard"): "lock_keyboard",
+            act_map.get("unlock_keyboard", "unlock_keyboard"): "unlock_keyboard",
+            act_map.get("toggle_sleep_mode", "toggle_sleep_mode"): "toggle_sleep_mode",
+            act_map.get("sleep_never", "sleep_never"): "sleep_never",
+            act_map.get("sleep_5min", "sleep_5min"): "sleep_5min",
+            act_map.get("speak", "speak"): "speak",
+            act_map.get("open_url", "open_url"): "open_url",
+            act_map.get("hotkey", "hotkey"): "hotkey",
+            act_map.get("type_text", "type_text"): "type_text",
+            act_map.get("run_cmd", "run_cmd"): "run_cmd",
+            act_map.get("screenshot", "screenshot"): "screenshot",
+            act_map.get("set_volume", "set_volume"): "set_volume",
+            act_map.get("pause", "pause"): "pause",
+            act_map.get("volume_up", "volume_up"): "volume_up",
+            act_map.get("volume_down", "volume_down"): "volume_down",
+            act_map.get("volume_mute", "volume_mute"): "volume_mute",
+            act_map.get("media_play_pause", "media_play_pause"): "media_play_pause",
+            act_map.get("media_next", "media_next"): "media_next",
+            act_map.get("lock_pc", "lock_pc"): "lock_pc",
+            act_map.get("sleep_pc", "sleep_pc"): "sleep_pc"
+        }
+        self.rev_actions_dict = {v: k for k, v in self.actions_dict.items()}
+
+        if self.cur_lang == "en":
+            self.voice_options = {
+                self.t("voice_en_kitsune"): ("edge-tts", "en-US-JennyNeural", "+32Hz", "+12%"),
+                self.t("voice_en_aria"): ("edge-tts", "en-US-AriaNeural", "+0Hz", "+2%"),
+                self.t("voice_en_ana"): ("edge-tts", "en-US-AnaNeural", "+0Hz", "+0%"),
+                self.t("voice_sapi"): ("pyttsx3", "", "+0Hz", "+0%")
+            }
+        else:
+            self.voice_options = {
+                self.t("voice_ru_kitsune"): ("edge-tts", "ru-RU-SvetlanaNeural", "+10Hz", "+15%"),
+                self.t("voice_ru_kawaii"): ("edge-tts", "ru-RU-SvetlanaNeural", "+75Hz", "+35%"),
+                self.t("voice_ru_svetlana"): ("edge-tts", "ru-RU-SvetlanaNeural", "-10Hz", "-5%"),
+                self.t("voice_sapi"): ("pyttsx3", "", "+0Hz", "+0%")
+            }
+
+    def _resolve_asset_path(self, config_key, default_resource_file):
+        cfg_val = self.core.config.get(config_key, "").strip()
+        if cfg_val and os.path.exists(cfg_val):
+            return cfg_val
+        res_p = resource_path(cfg_val if cfg_val else default_resource_file)
+        if os.path.exists(res_p):
+            return res_p
+        return None
+
+    def load_fox_avatar(self):
+        avatar_path = self._resolve_asset_path("avatar_path", "fox_avatar.png")
+        self.fox_avatar_tk = None
+        self.fox_avatar_dim_tk = None
+        if avatar_path and os.path.exists(avatar_path):
+            try:
+                pil_img = Image.open(avatar_path).convert("RGBA")
+                target_size = (185, 185)
+                pil_resized = pil_img.resize(target_size, Image.Resampling.LANCZOS)
+                self.fox_avatar_tk = ImageTk.PhotoImage(pil_resized)
+
+                dim_img = pil_resized.copy()
+                r, g, b, a = dim_img.split()
+                r = r.point(lambda p: int(p * 0.25))
+                g = g.point(lambda p: int(p * 0.25))
+                b = b.point(lambda p: int(p * 0.25))
+                a = a.point(lambda p: int(p * 0.40))
+                dim_img = Image.merge("RGBA", (r, g, b, a))
+                self.fox_avatar_dim_tk = ImageTk.PhotoImage(dim_img)
+            except Exception as e:
+                print(f"[Avatar Load Error]: {e}")
+
+    def auto_start_listening(self):
+        if not self.core.is_listening and self.core.model:
+            self.toggle_listen()
+
+    def load_sleep_icons(self):
+        path_5min = self._resolve_asset_path("icon_sleep_5min", "icon_5min.png")
+        path_never = self._resolve_asset_path("icon_sleep_never", "icon_never.png")
+        self.icon_5min = Image.open(path_5min) if path_5min else create_fallback_moon_icon()
+        self.icon_never = Image.open(path_never) if path_never else create_fallback_sun_icon()
+
+    def load_application_icon(self):
+        icon_path = self._resolve_asset_path("icon_path", "icon.png")
+        if icon_path and os.path.exists(icon_path):
+            try:
+                return Image.open(icon_path)
+            except Exception:
+                pass
+        return create_default_fox_icon()
+
+    def apply_window_icon(self):
+        try:
+            self._tk_icon = ImageTk.PhotoImage(self.current_pil_icon)
+            self.iconphoto(False, self._tk_icon)
+        except Exception:
+            pass
+
+    def init_main_system_tray(self):
+        menu = pystray.Menu(
+            item(self.t("tray_full"), lambda: self.handle_window_action("full"), default=True),
+            item(self.t("tray_mini"), lambda: self.handle_window_action("mini")),
+            item(self.t("tray_mic"), self.tray_toggle_listen),
+            pystray.Menu.SEPARATOR,
+            item(self.t("tray_quit"), self.quit_application)
+        )
+        self.tray_icon = pystray.Icon("kitsune_main_icon", self.current_pil_icon, self.t("tray_app_name"), menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def init_sleep_system_tray(self):
+        is_never = os.path.exists(MARKER_FILE)
+        current_img = self.icon_never if is_never else self.icon_5min
+        tooltip = self.t("tray_pwr_tooltip_never") if is_never else self.t("tray_pwr_tooltip_5min")
+
+        sleep_menu = pystray.Menu(
+            item(self.t("tray_toggle_sleep"), self.tray_toggle_sleep_action, default=True),
+            item(self.t("tray_sleep_never"), lambda: self.core.set_sleep_never()),
+            item(self.t("tray_sleep_5min"), lambda: self.core.set_sleep_5min())
+        )
+        self.sleep_tray = pystray.Icon("sleep_switcher_tray", current_img, tooltip, sleep_menu)
+        threading.Thread(target=self.sleep_tray.run, daemon=True).start()
+
+    def tray_toggle_sleep_action(self, icon=None, item=None):
+        self.core.toggle_sleep_mode()
+
+    def on_sleep_mode_changed(self, is_never: bool):
+        if self.sleep_tray:
+            self.sleep_tray.icon = self.icon_never if is_never else self.icon_5min
+            self.sleep_tray.title = self.t("tray_pwr_tooltip_never") if is_never else self.t("tray_pwr_tooltip_5min")
+
+    def handle_window_action(self, mode):
+        self.after(0, lambda: self.set_window_mode(mode))
+
+    def toggle_window_mode_on_click(self, event=None):
+        if self.current_window_mode == "full":
+            self.set_window_mode("mini")
+        else:
+            self.set_window_mode("full")
+
+    def set_window_mode(self, mode):
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+
+        if mode == "mini":
+            self.current_window_mode = "mini"
+            if self.state() == "zoomed":
+                self.state("normal")
+            self.minsize(200, 200)
+
+            self.sidebar.pack_forget()
+            self.frame_editor.pack_forget()
+            self.frame_settings.pack_forget()
+            self.status_card.pack_forget()
+            self.chat_card.pack_forget()
+            self.container.pack_forget()
+
+            self.container.pack(fill="both", expand=True, padx=2, pady=2)
+            self.frame_chat.pack(fill="both", expand=True)
+            self.reactor_frame.pack_forget()
+            self.reactor_frame.pack(fill="both", expand=True)
+
+            self.update_idletasks()
+            w, h = 330, 360
+            x = max(0, sw - w - 24)
+            y = max(0, sh - h - 68)
+
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            self.attributes("-topmost", True)
+            self.deiconify()
+            self.lift()
+            self.update_idletasks()
+            self.after(25, lambda: self.geometry(f"{w}x{h}+{x}+{y}"))
+
+        elif mode == "full":
+            self.current_window_mode = "full"
+            self.attributes("-topmost", False)
+            if self.state() == "zoomed":
+                self.state("normal")
+
+            self.container.pack_forget()
+            self.status_card.pack_forget()
+            self.reactor_frame.pack_forget()
+            self.chat_card.pack_forget()
+
+            self.sidebar.pack(side="left", fill="y", padx=(14, 0), pady=14)
+            self.container.pack(side="right", fill="both", expand=True, padx=14, pady=14)
+
+            self.status_card.pack(fill="x", pady=(0, 10))
+            self.reactor_frame.configure(height=360)
+            self.reactor_frame.pack(fill="x", pady=(0, 10))
+            self.chat_card.pack(fill="both", expand=True)
+
+            self.show_chat()
+            self.update_idletasks()
+
+            w, h = 1180, 850
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            
+            self.minsize(980, 700)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+            self.update_idletasks()
+            self.after(25, lambda: self.geometry(f"{w}x{h}+{x}+{y}"))
+
+        elif mode == "tray":
+            self.current_window_mode = "tray"
+            self.withdraw()
+            if self.tray_icon:
+                self.tray_icon.notify(self.t("tray_notif_hidden"), self.t("tray_app_name"))
+
+    def hide_to_tray(self):
+        self.set_window_mode("tray")
+
+    def show_from_tray(self, icon=None, item=None):
+        self.handle_window_action("full")
+
+    def tray_toggle_listen(self, icon=None, item=None):
+        self.after(0, self.toggle_listen)
+
+    def quit_application(self, icon=None, item=None):
+        if hasattr(self, 'core'):
+            if self.core.is_listening:
+                self.core.stop_listening()
+            if self.core.keyboard_locked:
+                self.core.unlock_keyboard()
+        if self.tray_icon:
+            self.tray_icon.stop()
+        if self.sleep_tray:
+            self.sleep_tray.stop()
+        self.after(50, self._clean_shutdown)
+
+    def _clean_shutdown(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def retranslate_ui(self):
+        self.title(self.t("app_title"))
+        self.lbl_logo_title.configure(text=self.t("app_brand"))
+        self.lbl_logo_subtitle.configure(text=self.t("app_subtitle"))
+
+        self.nav_btns["chat"].configure(text=self.t("nav_chat"))
+        self.nav_btns["editor"].configure(text=self.t("nav_editor"))
+        self.nav_btns["settings"].configure(text=self.t("nav_settings"))
+
+        if not self.core.is_listening:
+            self.btn_listen.configure(text=self.t("btn_wake"))
+        else:
+            self.btn_listen.configure(text=self.t("btn_sleep"))
+
+        self.status_lbl.configure(text=self.t("status_idle"))
+
+        self.lbl_editor_title.configure(text=self.t("editor_title"))
+        self.btn_load_packs.configure(text=self.t("editor_btn_load_packs"))
+        self.btn_new_cmd.configure(text=self.t("editor_btn_new"))
+        self.entry_cmd_search.configure(placeholder_text=self.t("editor_search_ph"))
+
+        self.lbl_editor_phrase.configure(text=self.t("editor_lbl_phrase"))
+        self.entry_cmd_name.configure(placeholder_text=self.t("editor_ph_phrase"))
+        self.lbl_editor_synonyms.configure(text=self.t("editor_lbl_synonyms"))
+        self.entry_synonyms.configure(placeholder_text=self.t("editor_ph_synonyms"))
+
+        self.lbl_steps_header.configure(text=self.t("editor_steps_header"))
+        self.btn_add_step.configure(text=self.t("editor_btn_add_step"))
+
+        self.btn_save_cmd.configure(text=self.t("editor_btn_save_cmd"))
+        self.btn_delete_cmd.configure(text=self.t("editor_btn_delete_cmd"))
+        self.btn_clear_cmd.configure(text=self.t("editor_btn_clear"))
+
+        self.setup_actions_and_voices()
+        
+        act_vals = list(self.actions_dict.keys())
+        for row in self.step_rows:
+            curr_act_key = row["action_key"]
+            row["combo"].configure(values=act_vals)
+            loc_name = self.rev_actions_dict.get(curr_act_key, act_vals[0])
+            row["combo"].set(loc_name)
+
+        self.lbl_settings_title.configure(text=self.t("settings_title"))
+        self.check_wake.configure(text=self.t("settings_chk_wake"))
+        self.lbl_settings_wake.configure(text=self.t("settings_lbl_wake"))
+        self.lbl_settings_lang.configure(text=self.t("settings_lbl_lang"))
+        self.lbl_settings_mic.configure(text=self.t("settings_lbl_mic"))
+        self.lbl_settings_voice.configure(text=self.t("settings_lbl_voice"))
+        self.lbl_settings_timeout.configure(text=self.t("settings_lbl_timeout"))
+        self.btn_save_settings.configure(text=self.t("settings_btn_save"))
+
+        self.combo_voice.configure(values=list(self.voice_options.keys()))
+        
+        input_devices = self.get_available_input_devices()
+        mic_display_values = [self.t("mic_default")] + [d[1] for d in input_devices]
+        self.combo_mic.configure(values=mic_display_values)
+        cur_mic = self.core.config.get("microphone", "")
+        if not cur_mic or cur_mic not in mic_display_values:
+            self.combo_mic.set(mic_display_values[0])
+        else:
+            self.combo_mic.set(cur_mic)
+        
+        cur_v = self.core.config.get("tts_voice", "")
+        cur_eng = self.core.config.get("tts_engine", "edge-tts")
+        cur_pitch = self.core.config.get("tts_pitch", "+0Hz")
+        
+        selected_voice_display = list(self.voice_options.keys())[0]
+        for k, v in self.voice_options.items():
+            if v[0] == cur_eng:
+                if v[0] == "pyttsx3":
+                    selected_voice_display = k
+                    break
+                if v[1] == cur_v and v[2] == cur_pitch:
+                    selected_voice_display = k
+                    break
+        self.combo_voice.set(selected_voice_display)
+        self.refresh_editor_command_list()
+
+    def on_language_selected(self, selected_label):
+        new_lang = LANG_OPTIONS.get(selected_label, "ru")
+        if new_lang != self.cur_lang:
+            self.cur_lang = new_lang
+            self.core.config["language"] = new_lang
+            
+            if new_lang == "en":
+                self.core.config["tts_voice"] = "en-US-JennyNeural"
+                self.core.config["tts_pitch"] = "+32Hz"
+                self.core.config["tts_rate_edge"] = "+12%"
+            else:
+                self.core.config["tts_voice"] = "ru-RU-SvetlanaNeural"
+                self.core.config["tts_pitch"] = "+35Hz"
+                self.core.config["tts_rate_edge"] = "+12%"
+            self.core.config["tts_engine"] = "edge-tts"
+            
+            self.core.save_config()
+            self.core.reload_language(new_lang)
+            self.lang = load_language_dict(self.cur_lang)
+            self.retranslate_ui()
+            self.update_chat("System", self.t("settings_lang_switched"))
+
+    def setup_ui(self):
+        self.sidebar = ctk.CTkFrame(
+            self, width=274, corner_radius=12,
+            fg_color=HUD_THEME["chassis_panel"],
+            border_color=HUD_THEME["panel_border"],
+            border_width=2
+        )
+        self.sidebar.pack(side="left", fill="y", padx=(14, 0), pady=14)
+        self.sidebar.pack_propagate(False)
+
+        logo_card = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        logo_card.pack(fill="x", padx=16, pady=(22, 16))
+
+        self.lbl_logo_title = ctk.CTkLabel(
+            logo_card, text=self.t("app_brand"), 
+            font=ctk.CTkFont(family="Consolas", size=22, weight="bold"),
+            text_color="#FFB703", anchor="w"
+        )
+        self.lbl_logo_title.pack(anchor="w")
+
+        self.lbl_logo_subtitle = ctk.CTkLabel(
+            logo_card, text=self.t("app_subtitle"), 
+            font=ctk.CTkFont(family="Consolas", size=9, weight="bold"),
+            text_color=HUD_THEME["text_dim"], anchor="w"
+        )
+        self.lbl_logo_subtitle.pack(anchor="w", pady=(2, 0))
+
+        self.nav_btns = {}
+        self.nav_btns["chat"] = self._create_nav_button(self.t("nav_chat"), self.show_chat)
+        self.nav_btns["chat"].pack(pady=4, padx=12, fill="x")
+
+        self.nav_btns["editor"] = self._create_nav_button(self.t("nav_editor"), self.show_editor)
+        self.nav_btns["editor"].pack(pady=4, padx=12, fill="x")
+
+        self.nav_btns["settings"] = self._create_nav_button(self.t("nav_settings"), self.show_settings)
+        self.nav_btns["settings"].pack(pady=4, padx=12, fill="x")
+
+        self.telemetry_card = ctk.CTkFrame(
+            self.sidebar, fg_color=HUD_THEME["panel_inner"],
+            corner_radius=10, border_color=HUD_THEME["panel_border"], border_width=1.5
+        )
+        self.telemetry_card.pack(fill="x", padx=12, pady=12, side="bottom")
+
+        self.canvas_telemetry = tk.Canvas(
+            self.telemetry_card, height=114, bg=HUD_THEME["panel_inner"],
+            highlightthickness=0, bd=0
+        )
+        self.canvas_telemetry.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.btn_listen = ctk.CTkButton(
+            self.sidebar, text=self.t("btn_sleep"), 
+            fg_color="#180C11",
+            hover_color="#2A121A",
+            border_color="#FB8500",
+            border_width=1.5,
+            text_color=HUD_THEME["text_bright"], 
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=40, corner_radius=8,
+            command=self.toggle_listen
+        )
+        self.btn_listen.pack(pady=(4, 10), padx=12, fill="x", side="bottom")
+
+        self.container = ctk.CTkFrame(self, fg_color="transparent")
+        self.container.pack(side="right", fill="both", expand=True, padx=14, pady=14)
+        
+        self.build_chat_screen()
+        self.build_editor_screen()
+        self.build_settings_screen()
+
+    def _create_nav_button(self, text, command):
+        return ctk.CTkButton(
+            self.sidebar, text=text,
+            fg_color="transparent", 
+            text_color=HUD_THEME["text_dim"],
+            hover_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            anchor="w", height=38, corner_radius=6,
+            command=command
+        )
+
+    def _highlight_active_nav(self, active_key):
+        self.current_screen = active_key
+        for key, btn in self.nav_btns.items():
+            if key == active_key:
+                btn.configure(
+                    fg_color=HUD_THEME["panel_card"],
+                    text_color="#FFB703",
+                    border_color="#FB8500",
+                    border_width=1.5
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent",
+                    text_color=HUD_THEME["text_dim"],
+                    border_width=0
+                )
+
+    def build_chat_screen(self):
+        self.frame_chat = ctk.CTkFrame(self.container, fg_color="transparent")
+        
+        self.status_card = ctk.CTkFrame(
+            self.frame_chat, height=44, 
+            fg_color=HUD_THEME["panel_card"],
+            corner_radius=8, border_color=HUD_THEME["panel_border"], border_width=1.5
+        )
+        self.status_card.pack(fill="x", pady=(0, 10))
+        self.status_card.pack_propagate(False)
+        
+        self.status_lbl = ctk.CTkLabel(
+            self.status_card, text=self.t("status_idle"), 
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            text_color=HUD_THEME["text_dim"]
+        )
+        self.status_lbl.pack(side="left", padx=16)
+
+        self.hud_clock_lbl = ctk.CTkLabel(
+            self.status_card, text=f"{self.t('clock_prefix', 'ЛИСЬЕ_ВРЕМЯ')}: --:--:--",
+            font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
+            text_color="#FFB703"
+        )
+        self.hud_clock_lbl.pack(side="right", padx=16)
+
+        self.reactor_frame = ctk.CTkFrame(
+            self.frame_chat, height=360,
+            fg_color=HUD_THEME["panel_inner"],
+            corner_radius=12, border_color=HUD_THEME["panel_border_light"], border_width=2
+        )
+        self.reactor_frame.pack(fill="x", pady=(0, 10))
+        self.reactor_frame.pack_propagate(False)
+
+        self.canvas_reactor = tk.Canvas(
+            self.reactor_frame, bg=HUD_THEME["panel_inner"],
+            highlightthickness=0, bd=0
+        )
+        self.canvas_reactor.pack(fill="both", expand=True)
+
+        ev_double = '<' + 'Double-Button-1' + '>'
+        self.canvas_reactor.bind(ev_double, self.toggle_window_mode_on_click)
+
+        self.chat_card = ctk.CTkFrame(
+            self.frame_chat, 
+            fg_color=HUD_THEME["panel_inner"],
+            corner_radius=10, border_color=HUD_THEME["panel_border"], border_width=1.5
+        )
+        self.chat_card.pack(fill="both", expand=True)
+
+        self.chat_box = ctk.CTkTextbox(
+            self.chat_card, 
+            font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color="transparent",
+            text_color=HUD_THEME["text_bright"],
+            border_width=0, corner_radius=10
+        )
+        self.chat_box.pack(fill="both", expand=True, padx=10, pady=10)
+        self.chat_box.insert("end", self.t("log_init_1") + self.t("log_init_2") + self.t("log_init_3"))
+        self.chat_box.configure(state="disabled")
+
+    def animate_hud(self):
+        w = self.canvas_reactor.winfo_width()
+        h = self.canvas_reactor.winfo_height()
+
+        target_spectrum = self.core.latest_spectrum
+        is_speaking = getattr(self.core, 'is_speaking', False)
+        is_cat_locked = getattr(self.core, 'keyboard_locked', False)
+        total_flux = float(np.sum(target_spectrum))
+
+        raw_heat = total_flux * 3.82 if self.core.is_listening else 0.0
+        self.smooth_heat = self.smooth_heat * 0.84 + raw_heat * 0.16
+        for i in range(NUM_BANDS):
+            v_t = target_spectrum[i] if self.core.is_listening else 0.0
+            self.smooth_spectrum[i] = self.smooth_spectrum[i] * 0.76 + v_t * 0.24
+
+        cw = self.canvas_telemetry.winfo_width()
+        ch = self.canvas_telemetry.winfo_height()
+        if cw > 30 and ch > 30:
+            self.canvas_telemetry.delete("all")
+            
+            for gy in range(0, ch, 14):
+                self.canvas_telemetry.create_line(0, gy, cw, gy, fill="#0B1017", width=1)
+            
+            self.canvas_telemetry.create_text(
+                10, 13, text=f"// {self.t('telemetry_title', 'СТАТУС СИСТЕМЫ')}",
+                font=("Consolas", 8, "bold"), fill=HUD_THEME["text_dim"], anchor="w"
+            )
+            self.canvas_telemetry.create_text(
+                cw - 10, 13, text=self.t("telemetry_online", "● АКТИВНО"),
+                font=("Consolas", 8, "bold"), fill=HUD_THEME["hud_green"], anchor="e"
+            )
+
+            is_never = os.path.exists(MARKER_FILE)
+            energy_prefix = self.t("telemetry_energy_label", "ЭНЕРГИЯ:")
+            status_fox = self.t("telemetry_fox_full_power") if is_never else self.t("telemetry_fox_wants_sleep")
+            pwr_text = f"{energy_prefix} {status_fox}"
+            
+            bat_color = HUD_THEME["hud_green"] if is_never else "#FFB703"
+            
+            self.canvas_telemetry.create_text(
+                10, 38, text=pwr_text,
+                font=("Consolas", 9, "bold"), fill=bat_color, anchor="w"
+            )
+
+            bw, bh = 34, 12
+            bx1 = cw - 13
+            bx0 = bx1 - bw
+            by0, by1 = 32, 44
+            self.canvas_telemetry.create_rectangle(bx0, by0, bx1, by1, outline=bat_color, width=1)
+            self.canvas_telemetry.create_rectangle(bx1, by0 + 3, bx1 + 3, by1 - 3, fill=bat_color, outline="")
+            
+            seg_w, seg_gap = 8, 2
+            active_segments = 3 if is_never else 1
+            for i in range(3):
+                sx0 = bx0 + 3 + i * (seg_w + seg_gap)
+                fill_col = bat_color if i < active_segments else ""
+                self.canvas_telemetry.create_rectangle(sx0, by0 + 2, sx0 + seg_w, by1 - 2, fill=fill_col, outline=bat_color if fill_col == "" else "")
+
+            self.canvas_telemetry.create_text(
+                10, 64, text="👂 СЛУХ:",
+                font=("Consolas", 8, "bold"), fill=HUD_THEME["text_dim"], anchor="w"
+            )
+            
+            eq_x = 58
+            y_base = 70
+            max_eq_h = 13
+            for bar_i in range(12):
+                bx = eq_x + bar_i * 5
+                self.canvas_telemetry.create_line(bx, y_base, bx, y_base - max_eq_h, fill=HUD_THEME["text_dark"], width=2)
+                bh_val = max(1, int(self.smooth_spectrum[bar_i] * max_eq_h)) if self.core.is_listening else 1
+                b_color = HUD_THEME["hud_cyan"] if self.core.is_listening else HUD_THEME["panel_border"]
+                self.canvas_telemetry.create_line(bx, y_base, bx, y_base - bh_val, fill=b_color, width=2)
+
+            heat_display = self.smooth_heat if self.core.is_listening else 0.0
+            self.canvas_telemetry.create_text(
+                10, 92, text=f"🔥 ТЕПЛО: {heat_display:5.2f} KTS",
+                font=("Consolas", 8, "bold"), fill="#FFB703", anchor="w"
+            )
+
+            tx = cw - 18
+            tube_top = 56
+            tube_bot = 88
+            tube_h = tube_bot - tube_top
+            
+            self.canvas_telemetry.create_rectangle(tx - 1, tube_top, tx + 2, tube_bot, fill=HUD_THEME["text_dark"], outline="")
+            merc_h = min(tube_h - 2, max(2, int((heat_display / 100.0) * (tube_h - 2))))
+            self.canvas_telemetry.create_rectangle(tx - 1, tube_bot - merc_h, tx + 2, tube_bot, fill="#FFB703", outline="")
+            self.canvas_telemetry.create_oval(tx - 4, 88, tx + 5, 97, fill="#FB8500", outline=HUD_THEME["panel_border"], width=1)
+            for tick in range(3):
+                tick_y = tube_top + 4 + tick * 10
+                self.canvas_telemetry.create_line(tx + 4, tick_y, tx + 7, tick_y, fill=HUD_THEME["panel_border_light"], width=1)
+
+        if w > 40 and h > 40:
+            self.canvas_reactor.delete("all")
+            cx, cy = w / 2, h / 2
+
+            grid_gap = 26
+            for gx in range(0, int(w), grid_gap):
+                self.canvas_reactor.create_line(gx, 0, gx, h, fill="#0A0E15", width=1)
+            for gy in range(0, int(h), grid_gap):
+                self.canvas_reactor.create_line(0, gy, w, gy, fill="#0A0E15", width=1)
+
+            self.scanline_y = (self.scanline_y + 1.8) % h
+            self.canvas_reactor.create_line(0, self.scanline_y, w, self.scanline_y, fill=HUD_THEME["hud_cyan_dim"], width=1)
+
+            clock_name = self.t("clock_prefix", "ЛИСЬЕ_ВРЕМЯ")
+            self.hud_clock_lbl.configure(text=f"{clock_name}: {time.strftime('%H:%M:%S')}")
+
+            if not self.core.is_listening:
+                if getattr(self, "fox_avatar_dim_tk", None):
+                    self.canvas_reactor.create_image(cx, cy - 6, image=self.fox_avatar_dim_tk)
+                elif self.fox_avatar_tk:
+                    self.canvas_reactor.create_image(cx, cy - 6, image=self.fox_avatar_tk)
+                else:
+                    self.canvas_reactor.create_text(
+                        cx, cy, text="🦊", font=("Segoe UI Emoji", 56), fill=HUD_THEME["text_dark"]
+                    )
+
+                if h > 300:
+                    status_standby = self.t("btn_sleep", "💤 РЕЖИМ ТИШИНЫ")
+                    self.canvas_reactor.create_text(
+                        cx, cy + (min(w, h) * 0.40), text=f"[ {status_standby} // STANDBY ]",
+                        font=("Consolas", 10, "bold"), fill=HUD_THEME["text_dim"]
+                    )
+                self.after(50, self.animate_hud)
+                return
+
+            self.flame_time += 0.085
+            self.rot_ring_inner += 0.016
+            self.rot_ring_outer -= 0.011
+
+            low_energy = float(np.mean(target_spectrum[:6])) if len(target_spectrum) >= 6 else 0.0
+
+            if is_cat_locked:
+                col_light = "#F0ABFC"
+                col_dark = "#701A75"
+            else:
+                col_light = HUD_THEME["flame_gold"]
+                col_dark = HUD_THEME["flame_crimson"]
+
+            r_inner = min(w, h) * 0.43
+            self.canvas_reactor.create_oval(
+                cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner,
+                outline=HUD_THEME["panel_border"], width=1, dash=(4, 8)
+            )
+            inner_runes = ["狐", "火", "霊", "気", "神", "幻", "炎", "魂", "零", "芯", "術", "零"]
+            for idx, sym in enumerate(inner_runes):
+                ang = math.radians(idx * (360 / len(inner_runes))) + self.rot_ring_inner
+                rx = cx + r_inner * math.cos(ang)
+                ry = cy + r_inner * math.sin(ang)
+                self.canvas_reactor.create_text(
+                    rx, ry, text=sym, font=("Consolas", 9, "bold"),
+                    fill=HUD_THEME["hud_cyan"] if idx % 2 == 0 else "#FFB703"
+                )
+
+            r_outer = min(w, h) * 0.47
+            self.canvas_reactor.create_oval(
+                cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer,
+                outline=HUD_THEME["panel_border_light"], width=1, dash=(2, 6)
+            )
+            outer_runes = ["キツネ", "システム", "コア", "フレーム", "ネオン", "マトリックス", "プロト", "アイ"]
+            for idx, sym in enumerate(outer_runes):
+                ang = math.radians(idx * (360 / len(outer_runes))) + self.rot_ring_outer
+                rx = cx + r_outer * math.cos(ang)
+                ry = cy + r_outer * math.sin(ang)
+                self.canvas_reactor.create_text(
+                    rx, ry, text=sym, font=("Consolas", 8, "bold"),
+                    fill="#FB8500" if idx % 2 == 0 else HUD_THEME["hud_cyan"]
+                )
+
+            r_radar = min(w, h) * 0.36
+            for deg in range(0, 360, 6):
+                rad = math.radians(deg) - self.rot_ring_inner * 0.5
+                is_major = (deg % 30 == 0)
+                l_tick = 8 if is_major else 3
+                col_tick = "#FFB703" if is_major else HUD_THEME["panel_border"]
+                x0 = cx + (r_radar - l_tick) * math.cos(rad)
+                y0 = cy + (r_radar - l_tick) * math.sin(rad)
+                x1 = cx + r_radar * math.cos(rad)
+                y1 = cy + r_radar * math.sin(rad)
+                self.canvas_reactor.create_line(x0, y0, x1, y1, fill=col_tick, width=1.5 if is_major else 1)
+
+            num_radial_pts = 36
+            base_r = min(w, h) * 0.20
+
+            def build_compact_flame_ring(layer_scale, time_mult, noise_mult, color_fill):
+                pts = []
+                for i in range(num_radial_pts):
+                    theta = (2 * math.pi * i) / num_radial_pts
+                    band_idx = int((i / num_radial_pts) * 14) % NUM_BANDS
+                    spec_val = target_spectrum[band_idx]
+
+                    upward_boost = max(0.0, -math.sin(theta)) * 14.0
+                    wave1 = math.sin(self.flame_time * time_mult + i * 0.7) * 5.5
+                    wave2 = math.cos(self.flame_time * (time_mult * 1.2) - i * 1.0) * 3.8
+                    
+                    voice_flare = (spec_val * 22.0 + low_energy * 10.0) * (0.8 + 0.2 * math.sin(i + self.flame_time))
+
+                    r = (base_r * layer_scale) + (wave1 + wave2) * noise_mult + upward_boost + voice_flare
+                    px = cx + r * math.cos(theta)
+                    py = cy + r * math.sin(theta)
+                    pts.extend([px, py])
+
+                if len(pts) >= 6:
+                    self.canvas_reactor.create_polygon(pts, fill=color_fill, outline="", smooth=True)
+
+            build_compact_flame_ring(1.30, 1.8, 1.1, HUD_THEME["flame_smoke"] if not is_cat_locked else "#3B0764")
+            build_compact_flame_ring(1.15, 2.5, 0.85, col_dark)
+            build_compact_flame_ring(1.00, 3.3, 0.55, col_light)
+
+            if self.fox_avatar_tk:
+                self.canvas_reactor.create_image(cx, cy - 2, image=self.fox_avatar_tk)
+            else:
+                self.canvas_reactor.create_text(cx, cy, text="🦊", font=("Segoe UI Emoji", 56), fill=col_light)
+
+            if h > 300:
+                if is_cat_locked:
+                    status_txt = self.t("status_cat_active")
+                elif is_speaking:
+                    status_txt = self.t("status_talking")
+                elif low_energy > 0.1:
+                    status_txt = self.t("status_listening")
+                else:
+                    status_txt = self.t("status_ready")
+
+                bx, by, bw_b, bh_b = cx, cy + (min(w, h) * 0.40), 150, 20
+                badge_pts = [
+                    bx - bw_b, by - bh_b,
+                    bx + bw_b - 8, by - bh_b,
+                    bx + bw_b, by - bh_b + 8,
+                    bx + bw_b, by + bh_b,
+                    bx - bw_b + 8, by + bh_b,
+                    bx - bw_b, by + bh_b - 8
+                ]
+                self.canvas_reactor.create_polygon(badge_pts, fill="#080C14", outline="#FB8500", width=1.5)
+                self.canvas_reactor.create_text(
+                    bx, by + 1, text=f"🦊 {status_txt}",
+                    font=("Consolas", 9, "bold"), fill="#FFB703"
+                )
+
+            sz, pad = 20, 14
+            self.canvas_reactor.create_line(pad, pad + sz, pad, pad + 6, pad + 6, pad, pad + sz, pad, fill=HUD_THEME["hud_cyan"], width=2)
+            self.canvas_reactor.create_line(w - pad - sz, pad, w - pad - 6, pad, w - pad, pad + 6, w - pad, pad + sz, fill=HUD_THEME["hud_cyan"], width=2)
+            self.canvas_reactor.create_line(pad, h - pad - sz, pad, h - pad - 6, pad + 6, h - pad, pad + sz, h - pad, fill=HUD_THEME["hud_cyan"], width=2)
+            self.canvas_reactor.create_line(w - pad - sz, h - pad, w - pad - 6, h - pad, w - pad, h - pad - 6, w - pad, h - pad - sz, fill=HUD_THEME["hud_cyan"], width=2)
+
+        self.after(22, self.animate_hud)
+
+    def build_editor_screen(self):
+        self.frame_editor = ctk.CTkFrame(self.container, fg_color="transparent")
+        
+        top_bar = ctk.CTkFrame(self.frame_editor, fg_color="transparent")
+        top_bar.pack(fill="x", pady=(0, 10))
+        
+        self.lbl_editor_title = ctk.CTkLabel(
+            top_bar, text=self.t("editor_title"), 
+            font=ctk.CTkFont(family="Consolas", size=18, weight="bold"),
+            text_color=HUD_THEME["text_bright"]
+        )
+        self.lbl_editor_title.pack(side="left")
+        
+        self.btn_load_packs = ctk.CTkButton(
+            top_bar, text=self.t("editor_btn_load_packs"), 
+            fg_color=HUD_THEME["panel_card"],
+            hover_color="#FB8500",
+            text_color=HUD_THEME["text_bright"],
+            border_color=HUD_THEME["panel_border"], border_width=1.5,
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=32, corner_radius=6,
+            command=self.load_sample_packs
+        )
+        self.btn_load_packs.pack(side="right", padx=(8, 0))
+
+        self.btn_new_cmd = ctk.CTkButton(
+            top_bar, text=self.t("editor_btn_new"), 
+            fg_color="#FB8500",
+            hover_color="#D94400",
+            text_color=HUD_THEME["chassis_dark"],
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=32, corner_radius=6,
+            command=self.create_new_command_form
+        )
+        self.btn_new_cmd.pack(side="right")
+
+        split_box = ctk.CTkFrame(self.frame_editor, fg_color="transparent")
+        split_box.pack(fill="both", expand=True)
+
+        left_panel = ctk.CTkFrame(
+            split_box, width=310,
+            fg_color=HUD_THEME["panel_card"],
+            border_color=HUD_THEME["panel_border"], border_width=1.5,
+            corner_radius=8
+        )
+        left_panel.pack(side="left", fill="y", padx=(0, 10))
+        left_panel.pack_propagate(False)
+
+        self.entry_cmd_search = ctk.CTkEntry(
+            left_panel, placeholder_text=self.t("editor_search_ph"),
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=11), corner_radius=6, height=32
+        )
+        self.entry_cmd_search.pack(fill="x", padx=10, pady=10)
+        
+        ev_key_release = '<' + 'KeyRelease' + '>'
+        self.entry_cmd_search.bind(ev_key_release, lambda e: self.refresh_editor_command_list())
+
+        self.cmd_list_scroll = ctk.CTkScrollableFrame(
+            left_panel, fg_color="transparent"
+        )
+        self.cmd_list_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        self.right_panel = ctk.CTkFrame(
+            split_box,
+            fg_color=HUD_THEME["panel_card"],
+            border_color=HUD_THEME["panel_border"], border_width=1.5,
+            corner_radius=8
+        )
+        self.right_panel.pack(side="right", fill="both", expand=True)
+
+        self.lbl_editor_mode = ctk.CTkLabel(
+            self.right_panel, text=self.t("editor_creating_title"),
+            font=ctk.CTkFont(family="Consolas", size=13, weight="bold"),
+            text_color="#FFB703", anchor="w"
+        )
+        self.lbl_editor_mode.pack(fill="x", padx=16, pady=(12, 6))
+
+        form_meta = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        form_meta.pack(fill="x", padx=16, pady=(0, 8))
+
+        self.lbl_editor_phrase = ctk.CTkLabel(
+            form_meta, text=self.t("editor_lbl_phrase"),
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            text_color=HUD_THEME["text_dim"], anchor="w"
+        )
+        self.lbl_editor_phrase.pack(anchor="w")
+
+        self.entry_cmd_name = ctk.CTkEntry(
+            form_meta, placeholder_text=self.t("editor_ph_phrase"),
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6, height=32
+        )
+        self.entry_cmd_name.pack(fill="x", pady=(2, 6))
+
+        self.lbl_editor_synonyms = ctk.CTkLabel(
+            form_meta, text=self.t("editor_lbl_synonyms"),
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            text_color=HUD_THEME["text_dim"], anchor="w"
+        )
+        self.lbl_editor_synonyms.pack(anchor="w")
+
+        self.entry_synonyms = ctk.CTkEntry(
+            form_meta, placeholder_text=self.t("editor_ph_synonyms"),
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=11), corner_radius=6, height=32
+        )
+        self.entry_synonyms.pack(fill="x", pady=(2, 4))
+
+        steps_header_bar = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        steps_header_bar.pack(fill="x", padx=16, pady=(6, 4))
+
+        self.lbl_steps_header = ctk.CTkLabel(
+            steps_header_bar, text=self.t("editor_steps_header"),
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            text_color=HUD_THEME["hud_cyan"], anchor="w"
+        )
+        self.lbl_steps_header.pack(side="left")
+
+        self.btn_add_step = ctk.CTkButton(
+            steps_header_bar, text=self.t("editor_btn_add_step"),
+            fg_color="#180C11", hover_color="#2A121A",
+            border_color="#FB8500", border_width=1.5,
+            text_color="#FFB703",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=28, corner_radius=6,
+            command=lambda: self.add_step_row(action="speak", value="")
+        )
+        self.btn_add_step.pack(side="right")
+
+        self.steps_container = ctk.CTkScrollableFrame(
+            self.right_panel,
+            fg_color=HUD_THEME["panel_inner"],
+            border_color=HUD_THEME["panel_border"], border_width=1,
+            corner_radius=8
+        )
+        self.steps_container.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        bottom_bar = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        bottom_bar.pack(fill="x", padx=16, pady=(0, 12))
+
+        self.btn_save_cmd = ctk.CTkButton(
+            bottom_bar, text=self.t("editor_btn_save_cmd"),
+            fg_color="#FB8500", hover_color="#D94400",
+            text_color=HUD_THEME["chassis_dark"],
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            height=36, corner_radius=6,
+            command=self.save_current_command
+        )
+        self.btn_save_cmd.pack(side="left", padx=(0, 10))
+
+        self.btn_delete_cmd = ctk.CTkButton(
+            bottom_bar, text=self.t("editor_btn_delete_cmd"),
+            fg_color="#280C11", hover_color="#450A14",
+            border_color="#D90429", border_width=1,
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            height=36, corner_radius=6,
+            command=self.delete_current_command
+        )
+        self.btn_delete_cmd.pack(side="left", padx=(0, 10))
+
+        self.btn_clear_cmd = ctk.CTkButton(
+            bottom_bar, text=self.t("editor_btn_clear"),
+            fg_color="transparent", hover_color=HUD_THEME["panel_inner"],
+            text_color=HUD_THEME["text_dim"],
+            font=ctk.CTkFont(family="Consolas", size=11),
+            height=36, corner_radius=6,
+            command=self.create_new_command_form
+        )
+        self.btn_clear_cmd.pack(side="left")
+
+        self.refresh_editor_command_list()
+        self.create_new_command_form()
+
+    def refresh_editor_command_list(self):
+        for widget in self.cmd_list_scroll.winfo_children():
+            widget.destroy()
+
+        search_q = self.entry_cmd_search.get().lower().strip()
+        active_dict = self.core.commands_en if self.cur_lang == "en" else self.core.commands_ru
+
+        matched_keys = []
+        for cmd_name, cmd_data in active_dict.items():
+            syns = " ".join(cmd_data.get("synonyms", [])).lower()
+            if not search_q or search_q in cmd_name.lower() or search_q in syns:
+                matched_keys.append(cmd_name)
+
+        if not matched_keys:
+            lbl_empty = ctk.CTkLabel(
+                self.cmd_list_scroll, text=self.t("editor_no_cmds"),
+                font=ctk.CTkFont(family="Consolas", size=11),
+                text_color=HUD_THEME["text_dim"]
+            )
+            lbl_empty.pack(pady=20)
+            return
+
+        for cmd in matched_keys:
+            is_active = (cmd == self.current_editing_cmd)
+            step_count = len(active_dict[cmd].get("steps", []))
+            
+            btn = ctk.CTkButton(
+                self.cmd_list_scroll,
+                text=f"🦊 {cmd}  [{step_count}]",
+                anchor="w",
+                font=ctk.CTkFont(family="Consolas", size=11, weight="bold" if is_active else "normal"),
+                fg_color=HUD_THEME["panel_inner"] if not is_active else "#22141C",
+                hover_color="#2A1620",
+                text_color="#FFB703" if is_active else HUD_THEME["text_bright"],
+                border_color="#FB8500" if is_active else HUD_THEME["panel_border"],
+                border_width=1.5 if is_active else 1,
+                corner_radius=6, height=32,
+                command=lambda c=cmd: self.load_command_into_editor(c)
+            )
+            btn.pack(fill="x", pady=2)
+
+    def load_command_into_editor(self, cmd_name):
+        active_dict = self.core.commands_en if self.cur_lang == "en" else self.core.commands_ru
+        if cmd_name not in active_dict:
+            return
+
+        self.current_editing_cmd = cmd_name
+        cmd_data = active_dict[cmd_name]
+
+        self.lbl_editor_mode.configure(text=self.t("editor_editing_title").format(name=cmd_name))
+        
+        self.entry_cmd_name.delete(0, 'end')
+        self.entry_cmd_name.insert(0, cmd_name)
+
+        self.entry_synonyms.delete(0, 'end')
+        self.entry_synonyms.insert(0, ", ".join(cmd_data.get("synonyms", [])))
+
+        self.clear_step_rows()
+
+        steps = cmd_data.get("steps", [])
+        if steps:
+            for s in steps:
+                self.add_step_row(action=s.get("action", "speak"), value=s.get("value", ""))
+        else:
+            self.add_step_row(action="speak", value="")
+
+        self.refresh_editor_command_list()
+
+    def create_new_command_form(self):
+        self.current_editing_cmd = None
+        self.lbl_editor_mode.configure(text=self.t("editor_creating_title"))
+
+        self.entry_cmd_name.delete(0, 'end')
+        self.entry_synonyms.delete(0, 'end')
+
+        self.clear_step_rows()
+        self.add_step_row(action="speak", value="")
+        self.refresh_editor_command_list()
+
+    def clear_step_rows(self):
+        for row in self.step_rows:
+            row["frame"].destroy()
+        self.step_rows.clear()
+
+    def add_step_row(self, action="speak", value=""):
+        row_frame = ctk.CTkFrame(
+            self.steps_container, fg_color=HUD_THEME["panel_card"],
+            border_color=HUD_THEME["panel_border"], border_width=1, corner_radius=6
+        )
+        row_frame.pack(fill="x", pady=3, padx=2)
+
+        lbl_num = ctk.CTkLabel(
+            row_frame, text=f"#{len(self.step_rows) + 1:02d}",
+            font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
+            text_color="#FFB703", width=34
+        )
+        lbl_num.pack(side="left", padx=(8, 4))
+
+        act_values = list(self.actions_dict.keys())
+        combo = ctk.CTkComboBox(
+            row_frame, values=act_values, width=240,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=11), corner_radius=6
+        )
+        loc_name = self.rev_actions_dict.get(action, act_values[0])
+        combo.set(loc_name)
+        combo.pack(side="left", padx=4, pady=6)
+
+        entry_val = ctk.CTkEntry(
+            row_frame, placeholder_text=self.t("editor_ph_param"),
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=11), corner_radius=6
+        )
+        entry_val.insert(0, str(value))
+        entry_val.pack(side="left", fill="x", expand=True, padx=4, pady=6)
+
+        row_data = {
+            "frame": row_frame,
+            "lbl_num": lbl_num,
+            "combo": combo,
+            "entry": entry_val,
+            "action_key": action
+        }
+
+        btn_del = ctk.CTkButton(
+            row_frame, text="✕", width=28, height=28,
+            fg_color="#200B0E", hover_color="#450A14",
+            border_color="#D90429", border_width=1,
+            text_color="#F8FAFC",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            corner_radius=6,
+            command=lambda r=row_data: self.remove_step_row(r)
+        )
+        btn_del.pack(side="right", padx=(4, 8), pady=6)
+
+        self.step_rows.append(row_data)
+
+    def remove_step_row(self, row_data):
+        if row_data in self.step_rows:
+            self.step_rows.remove(row_data)
+            row_data["frame"].destroy()
+            self.renumber_step_rows()
+
+        if len(self.step_rows) == 0:
+            self.add_step_row(action="speak", value="")
+
+    def renumber_step_rows(self):
+        for idx, row in enumerate(self.step_rows):
+            row["lbl_num"].configure(text=f"#{idx + 1:02d}")
+
+    def save_current_command(self):
+        name = self.entry_cmd_name.get().lower().strip()
+        if not name:
+            return
+
+        raw_syns = self.entry_synonyms.get().split(",")
+        synonyms = [s.strip().lower() for s in raw_syns if s.strip()]
+
+        steps = []
+        for row in self.step_rows:
+            chosen_display = row["combo"].get()
+            act_key = self.actions_dict.get(chosen_display, "speak")
+            val = row["entry"].get().strip()
+            steps.append({"action": act_key, "value": val})
+
+        if not steps:
+            steps = [{"action": "speak", "value": "OK"}]
+
+        self.core.save_command_definition(
+            cmd_name=name,
+            steps=steps,
+            synonyms=synonyms,
+            old_name=self.current_editing_cmd,
+            lang=self.cur_lang
+        )
+
+        self.current_editing_cmd = name
+        self.lbl_editor_mode.configure(text=self.t("editor_editing_title").format(name=name))
+        self.refresh_editor_command_list()
+        self.update_chat("System", self.t("editor_status_saved").format(name=name))
+
+    def delete_current_command(self):
+        if not self.current_editing_cmd:
+            return
+
+        cmd_to_del = self.current_editing_cmd
+        if self.core.delete_command(cmd_to_del, lang=self.cur_lang):
+            self.create_new_command_form()
+            self.update_chat("System", self.t("editor_status_deleted").format(name=cmd_to_del))
+
+    def build_settings_screen(self):
+        self.frame_settings = ctk.CTkFrame(self.container, fg_color="transparent")
+        
+        self.lbl_settings_title = ctk.CTkLabel(
+            self.frame_settings, text=self.t("settings_title"), 
+            font=ctk.CTkFont(family="Consolas", size=18, weight="bold"),
+            text_color=HUD_THEME["text_bright"]
+        )
+        self.lbl_settings_title.pack(anchor="w", pady=(0, 16))
+        
+        box = ctk.CTkFrame(
+            self.frame_settings, 
+            fg_color=HUD_THEME["panel_card"],
+            border_color=HUD_THEME["panel_border"], border_width=1.5,
+            corner_radius=8
+        )
+        box.pack(fill="x", padx=2, pady=10)
+        
+        self.check_wake = ctk.CTkCheckBox(
+            box, text=self.t("settings_chk_wake"),
+            text_color=HUD_THEME["text_bright"],
+            fg_color="#FB8500",
+            hover_color="#D94400",
+            font=ctk.CTkFont(family="Consolas", size=12)
+        )
+        if self.core.config.get("require_wake_word", True):
+            self.check_wake.select()
+        self.check_wake.pack(anchor="w", padx=22, pady=(22, 12))
+        
+        self.lbl_settings_wake = ctk.CTkLabel(box, text=self.t("settings_lbl_wake"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_wake.pack(anchor="w", padx=22, pady=(10, 2))
+        
+        self.entry_wake = ctk.CTkEntry(
+            box, width=320, 
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        self.entry_wake.insert(0, self.core.config.get("wake_word", "лисичка"))
+        self.entry_wake.pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.lbl_settings_lang = ctk.CTkLabel(box, text=self.t("settings_lbl_lang"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_lang.pack(anchor="w", padx=22, pady=(5, 2))
+        
+        self.combo_lang = ctk.CTkComboBox(
+            box, values=list(LANG_OPTIONS.keys()), width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6,
+            command=self.on_language_selected
+        )
+        initial_lang_label = "🇷🇺 Русский (RU)" if self.cur_lang == "ru" else "🇬🇧 English (EN)"
+        self.combo_lang.set(initial_lang_label)
+        self.combo_lang.pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.lbl_settings_mic = ctk.CTkLabel(box, text=self.t("settings_lbl_mic"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_mic.pack(anchor="w", padx=22, pady=(5, 2))
+
+        input_devices = self.get_available_input_devices()
+        mic_display_values = [self.t("mic_default")] + [d[1] for d in input_devices]
+
+        self.combo_mic = ctk.CTkComboBox(
+            box, values=mic_display_values, width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        cur_mic = self.core.config.get("microphone", "")
+        if not cur_mic or cur_mic not in mic_display_values:
+            self.combo_mic.set(mic_display_values[0])
+        else:
+            self.combo_mic.set(cur_mic)
+        self.combo_mic.pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.lbl_settings_voice = ctk.CTkLabel(box, text=self.t("settings_lbl_voice"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_voice.pack(anchor="w", padx=22, pady=(5, 2))
+        
+        self.combo_voice = ctk.CTkComboBox(
+            box, values=list(self.voice_options.keys()), width=400,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            dropdown_fg_color=HUD_THEME["panel_card"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        cur_v = self.core.config.get("tts_voice", "")
+        cur_eng = self.core.config.get("tts_engine", "edge-tts")
+        cur_pitch = self.core.config.get("tts_pitch", "+0Hz")
+        
+        selected_voice_display = list(self.voice_options.keys())[0]
+        for k, v in self.voice_options.items():
+            if v[0] == cur_eng:
+                if v[0] == "pyttsx3":
+                    selected_voice_display = k
+                    break
+                if v[1] == cur_v and v[2] == cur_pitch:
+                    selected_voice_display = k
+                    break
+                    
+        self.combo_voice.set(selected_voice_display)
+        self.combo_voice.pack(anchor="w", padx=22, pady=(0, 16))
+        
+        self.lbl_settings_timeout = ctk.CTkLabel(box, text=self.t("settings_lbl_timeout"), text_color=HUD_THEME["text_dim"], font=ctk.CTkFont(family="Consolas", size=12))
+        self.lbl_settings_timeout.pack(anchor="w", padx=22, pady=(5, 2))
+        
+        self.entry_timeout = ctk.CTkEntry(
+            box, width=120,
+            fg_color=HUD_THEME["panel_inner"], border_color=HUD_THEME["panel_border"],
+            font=ctk.CTkFont(family="Consolas", size=12), corner_radius=6
+        )
+        self.entry_timeout.insert(0, str(self.core.config.get("wake_timeout", 7.0)))
+        self.entry_timeout.pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.btn_save_settings = ctk.CTkButton(
+            box, text=self.t("settings_btn_save"), 
+            fg_color="#FB8500",
+            hover_color="#D94400",
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            height=40, corner_radius=6,
+            command=self.save_settings
+        )
+        self.btn_save_settings.pack(anchor="w", padx=22, pady=(0, 22))
+
+    def update_chat(self, sender, text):
+        def _call():
+            ts = time.strftime("%H:%M:%S")
+            prefix = "[SYS_LINK]" if sender == "System" else f"[{sender}]"
+            self.chat_box.configure(state="normal")
+            self.chat_box.insert("end", f"[{ts}] {prefix}: {text}\n")
+            self.chat_box.see("end")
+            self.chat_box.configure(state="disabled")
+        self.after(0, _call)
+
+    def update_status_badge(self, text, color):
+        def _call():
+            self.status_lbl.configure(text=f"◆ {text.upper()}", text_color=color)
+        self.after(0, _call)
+
+    def save_settings(self):
+        self.core.config["require_wake_word"] = bool(self.check_wake.get())
+        self.core.config["wake_word"] = self.entry_wake.get().lower().strip()
+        
+        chosen_lang_label = self.combo_lang.get()
+        new_lang = LANG_OPTIONS.get(chosen_lang_label, "ru")
+        self.core.config["language"] = new_lang
+
+        choice = self.combo_voice.get()
+        if choice in self.voice_options:
+            engine_type, voice_name, pitch_mod, rate_mod = self.voice_options[choice]
+            self.core.config["tts_engine"] = engine_type
+            self.core.config["tts_voice"] = voice_name
+            self.core.config["tts_pitch"] = pitch_mod
+            self.core.config["tts_rate_edge"] = rate_mod
+
+        chosen_mic_label = self.combo_mic.get()
+        default_mic_text = self.t("mic_default")
+        if chosen_mic_label == default_mic_text or not chosen_mic_label:
+            self.core.config["microphone"] = ""
+        else:
+            self.core.config["microphone"] = chosen_mic_label
+
+        try:
+            self.core.config["wake_timeout"] = float(self.entry_timeout.get())
+        except ValueError:
+            self.core.config["wake_timeout"] = 7.0
+        
+        self.core.save_config()
+        self.core.reset_wake_state()
+
+    def load_sample_packs(self):
+        self.core.load_all_commands()
+        self.refresh_editor_command_list()
+        self.update_chat("System", self.t("editor_packs_reloaded"))
+
+    def show_chat(self):
+        self.frame_editor.pack_forget()
+        self.frame_settings.pack_forget()
+        self.frame_chat.pack(fill="both", expand=True)
+        self._highlight_active_nav("chat")
+
+    def show_editor(self):
+        self.frame_chat.pack_forget()
+        self.frame_settings.pack_forget()
+        self.frame_editor.pack(fill="both", expand=True)
+        self._highlight_active_nav("editor")
+
+    def show_settings(self):
+        self.frame_chat.pack_forget()
+        self.frame_editor.pack_forget()
+        self.frame_settings.pack(fill="both", expand=True)
+        self._highlight_active_nav("settings")
+
+    def toggle_listen(self):
+        if not self.core.is_listening:
+            self.btn_listen.configure(
+                text=self.t("btn_sleep"),
+                fg_color="#180C11",
+                hover_color="#2A121A",
+                border_color="#FB8500",
+                border_width=1.5
+            )
+            self.core.start_listening()
+        else:
+            self.btn_listen.configure(
+                text=self.t("btn_wake"),
+                fg_color="#FB8500",
+                hover_color="#D94400",
+                border_width=0
+            )
+            self.core.stop_listening()
+            self.core.latest_spectrum = [0.0] * NUM_BANDS
+
+if __name__ == "__main__":
+    app = FoxAssistantApp()
+    app.mainloop()
