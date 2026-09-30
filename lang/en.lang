@@ -128,7 +128,7 @@
     "full_deps_module_missing": "Engine download module is unavailable.",
     "vosk_model_downloading": "Downloading the Vosk model for basic recognition...",
     "vosk_model_ready": "Vosk model ready — listening can start.",
-    "vosk_model_failed": "Could not download the Vosk model. Download the zip manually and unpack it into the model/ folder.",
+    "vosk_model_failed": "Automatic Vosk download is blocked (often HTTP 403 or a proxy). Download the model manually — see instructions below.",
     "ui_skills_tag": "🦊 Skills",
     "ui_mic_tag": "🎙️ Microphone",
     "ui_voice_tag": "🔊 Voice",

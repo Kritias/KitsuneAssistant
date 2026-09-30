@@ -113,11 +113,15 @@ if "%NEED_DEPS%"=="1" (
 REM --- 3b. Vosk speech model (required for basic mode) -----------------------
 REM Weights are gitignored (~45 MB). Without them recognition cannot start.
 echo [2b/3] Checking Vosk model in model\ ...
+set "PYTHONIOENCODING=utf-8"
 "%VENV_PY%" "%~dp0basic_setup.py"
 if errorlevel 1 (
-    echo [ERROR] Vosk model is missing. Download
-    echo         https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip
-    echo         and unpack it into the model\ folder so that model\conf exists.
+    echo.
+    echo [ERROR] Vosk model was not downloaded automatically.
+    echo         Often the host returns HTTP 403 or requires a proxy.
+    echo         Download the zip manually and unpack it so that model\conf exists:
+    "%VENV_PY%" "%~dp0basic_setup.py" --manual
+    echo.
     if "%SETUP_ONLY%"=="1" exit /b 1
 )
 

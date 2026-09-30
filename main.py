@@ -770,12 +770,13 @@ class FoxAssistantApp(ctk.CTk):
 
         def worker():
             ok = False
+            unexpected = None
             try:
                 ok = basic_setup.ensure_vosk_model(
                     progress=lambda m: self.after(0, lambda msg=m: self.update_chat("System", msg))
                 )
             except Exception as exc:
-                self.after(0, lambda: self.update_chat("System", f"{self.t('vosk_model_failed')}: {exc}"))
+                unexpected = exc
 
             def finish():
                 self._vosk_fetch_busy = False
@@ -792,14 +793,35 @@ class FoxAssistantApp(ctk.CTk):
                             self.update_chat("System", self.t("vosk_model_ready"))
                         except Exception as exc:
                             self.update_chat("System", f"{self.t('vosk_model_failed')}: {exc}")
+                            self._show_vosk_manual_help()
                     else:
-                        self.update_chat("System", self.t("vosk_model_failed"))
-                else:
-                    self.update_chat("System", self.t("vosk_model_failed"))
+                        self._show_vosk_manual_help()
+                    return
+                # При обычном отказе ensure_vosk_model уже написал инструкцию
+                # через progress. Дублируем только если упали исключением.
+                if unexpected is not None:
+                    self.update_chat(
+                        "System",
+                        f"{self.t('vosk_model_failed')}: {unexpected}",
+                    )
+                    self._show_vosk_manual_help()
 
             self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_vosk_manual_help(self):
+        """Пишет в чат, откуда скачать Vosk вручную, если автозагрузка убита 403/прокси."""
+        self.update_chat("System", self.t("vosk_model_failed"))
+        if basic_setup is None:
+            return
+        try:
+            text = basic_setup.manual_install_instructions()
+        except Exception:
+            return
+        for line in text.splitlines():
+            if line.strip():
+                self.update_chat("System", line)
 
     def _start_component_install(self, components, pending_config=None):
         """Окно прогресса: качает выбранные движки и один раз перезапускает.

@@ -135,9 +135,11 @@ fi
 # Веса не в git (~45 МБ). Без них распознавание не стартует.
 echo "🎧 Проверяю модель Vosk в model/ ..."
 if ! "$VENV_PY" "$PROJECT_DIR/basic_setup.py"; then
-    echo "❌ Модель Vosk не скачалась. Скачай вручную"
-    echo "   https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
-    echo "   и распакуй в model/, чтобы появился model/conf."
+    echo
+    echo "❌ Модель Vosk не скачалась автоматически (часто HTTP 403 или нужен прокси)."
+    echo "   Скачай архив вручную и распакуй так, чтобы появился model/conf:"
+    "$VENV_PY" "$PROJECT_DIR/basic_setup.py" --manual || true
+    echo
     if [ "$SETUP_ONLY" -eq 1 ]; then
         exit 1
     fi

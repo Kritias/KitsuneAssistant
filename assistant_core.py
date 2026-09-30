@@ -651,33 +651,170 @@ class FoxAssistantCore:
         text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
         return re.sub(r"\s+", " ", text).strip()
 
+    def _grammar_slot_fillers(self, slot_type, lang):
+        """Конкретные слова для слота в grammar-режиме Vosk.
+
+        Без этого шаблоны вроде «курс {currency}» в словарь не попадают, и
+        «курс доллара» схлопывается в голое «курс валюты».
+        """
+        fillers = []
+        if slot_type == "currency" and cbr_rates is not None:
+            for info in cbr_rates.CURRENCIES.values():
+                fillers.extend(info.get("aliases") or [])
+        elif slot_type == "coin" and crypto_rates is not None:
+            for info in crypto_rates.COINS.values():
+                fillers.extend(info.get("aliases") or [])
+        elif slot_type == "weather" and weather is not None:
+            places = getattr(weather, "PLACES", {}) or {}
+            for place in places.values():
+                fillers.extend(place.get("aliases") or [])
+            # Короткие временны́е слова — без комбинаторного взрыва с городами.
+            fillers.extend(
+                ["сегодня", "завтра", "послезавтра", "утром", "вечером"]
+                if lang == "ru"
+                else ["today", "tomorrow", "morning", "evening"]
+            )
+        # number — бесконечный набор, в grammar не раскрываем.
+        cleaned = []
+        seen = set()
+        for raw in fillers:
+            norm = self._normalize_text(raw)
+            if not norm or norm in seen:
+                continue
+            if lang == "ru" and not re.search(r"[а-я]", norm):
+                continue
+            if lang == "en" and not re.search(r"[a-z]", norm):
+                continue
+            # Длинные алиасы раздувают grammar и почти не произносят целиком.
+            if len(norm.split()) > 2:
+                continue
+            seen.add(norm)
+            cleaned.append(norm)
+        return cleaned
+
+    def _expand_grammar_template(self, template, slots, lang, with_dates=False):
+        """«курс {currency}» → «курс доллара», «курс евро», …"""
+        match = SLOT_TOKEN_RE.search(template or "")
+        if not match:
+            norm = self._normalize_text(template)
+            return [norm] if norm else []
+
+        slot_name = match.group(1)
+        kind = ((slots or {}).get(slot_name) or {}).get("type", "")
+        fillers = self._grammar_slot_fillers(kind, lang)
+        if not fillers:
+            return []
+
+        prefix = template[: match.start()]
+        suffix = template[match.end():]
+        expanded = [
+            self._normalize_text(f"{prefix}{fill}{suffix}") for fill in fillers
+        ]
+
+        # Даты только для коротких базовых шаблонов — иначе словарь раздувается.
+        if with_dates and kind == "currency":
+            date_tails = (
+                ("на вчера", "на сегодня")
+                if lang == "ru"
+                else ("for yesterday", "for today")
+            )
+            for fill in fillers:
+                if len(fill.split()) > 1:
+                    continue
+                for tail in date_tails:
+                    expanded.append(
+                        self._normalize_text(f"{prefix}{fill} {tail}{suffix}")
+                    )
+        return [p for p in expanded if p]
+
     def _build_grammar_phrases(self):
-        """Собирает словарь активного языка в список фраз для grammar-режима."""
+        """Собирает словарь активного языка в список фраз для grammar-режима.
+
+        Шаблоны со слотами раскрываются в конкретные фразы (курс доллара,
+        курс биткоина). Иначе Vosk знает только «курс валюты» без валюты.
+        """
         lang = self.config.get("asr_grammar_lang", self.config.get("language", "ru"))
         data = self.command_data_ru if lang == "ru" else self.command_data_en
 
         phrases = set()
+        # Полное раскрытие — только у коротких шаблонов; длинные синонимы
+        # («какой курс валюты {currency}») дают тот же смысл ценой тысяч фраз.
+        prefer_templates = {
+            "курс {currency}",
+            "курс валюты {currency}",
+            "курс {coin}",
+            "погода {query}",
+            "какая погода {query}",
+            "погода на {query}",
+            "какая погода на {query}",
+            "weather {query}",
+            "weather in {query}",
+            "rate of {currency}",
+            "cbr rate of {currency}",
+            "{coin} price",
+            "price of {coin}",
+        }
         for name, cdata in data.get("commands", {}).items():
-            phrases.add(name)
-            phrases.update(cdata.get("synonyms", []))
+            slots = cdata.get("slots") or {}
+            templates = [name, *(cdata.get("synonyms", []) or [])]
+            for template in templates:
+                if not SLOT_TOKEN_RE.search(template):
+                    phrases.add(template)
+                    continue
+                raw = template.strip().lower()
+                if raw not in prefer_templates:
+                    continue
+                with_dates = raw in {
+                    "курс {currency}",
+                    "курс валюты {currency}",
+                    "rate of {currency}",
+                }
+                phrases.update(
+                    self._expand_grammar_template(
+                        template, slots, lang, with_dates=with_dates
+                    )
+                )
         for cdata in data.get("chitchat", {}).values():
             phrases.update(cdata.get("triggers", []))
         phrases.add(self.config.get("wake_word", "лисичка"))
         phrases.update(self.config.get("wake_aliases", []))
         phrases.update(self.config.get("asr_grammar_extra", []) or [])
 
+        # Оклик + команда одной фразой. Только русские/английские оклики
+        # под язык модели и только курсы/погода — иначе десятки тысяч строк.
+        wakes = []
+        for wake in [self.config.get("wake_word", "лисичка"), *(self.config.get("wake_aliases") or [])]:
+            norm = self._normalize_text(wake)
+            if not norm or norm in wakes:
+                continue
+            if lang == "ru" and not re.search(r"[а-я]", norm):
+                continue
+            if lang == "en" and not re.search(r"[a-z]", norm):
+                continue
+            wakes.append(norm)
+        # Хватит основных окликов: полный список aliases раздувает dictionary.
+        wakes = wakes[:4]
+
+        rate_markers = ("курс", "погода", "weather", "rate", "price", "валют", "крипт")
+        with_wake = set()
+        for phrase in list(phrases):
+            norm = self._normalize_text(phrase)
+            if not norm or not any(marker in norm for marker in rate_markers):
+                continue
+            # С окликом только короткие команды: «рыжая курс доллара».
+            if len(norm.split()) > 6:
+                continue
+            for wake in wakes:
+                with_wake.add(f"{wake} {norm}")
+        phrases.update(with_wake)
+
         cleaned, seen = [], set()
         for phrase in phrases:
             norm = self._normalize_text(phrase)
             if not norm or norm in seen:
                 continue
-            # Шаблоны со слотами в грамматику не годятся: Vosk — это список
-            # готовых фраз, «серия {number}» с любым номером туда не вписать, а
-            # нормализация превратила бы {number} в лишнее слово «number».
             if SLOT_TOKEN_RE.search(phrase):
                 continue
-            # Русская модель не знает латиницы — такие фразы Vosk всё равно
-            # отбросит, поэтому не засоряем ими грамматику.
             if lang == "ru" and not re.search(r"[а-я]", norm):
                 continue
             seen.add(norm)
@@ -2356,6 +2493,50 @@ class FoxAssistantCore:
             return None, {}
         return best[1], best[2]
 
+    def _rescue_slot_values(self, cmd_name, command_text):
+        """Достаёт слот из всей фразы, если шаблонное окно не сработало.
+
+        Бывает после grammar/ASR: «курс валюты доллара» не совпало с
+        «курс {currency}», зато валюта в тексте всё ещё есть.
+        """
+        cmd_data = self.commands.get(cmd_name) or {}
+        slots = cmd_data.get("slots") or {}
+        if not slots:
+            return None
+        text = self._normalize_text(command_text)
+        if not text:
+            return None
+
+        for slot_name, spec in slots.items():
+            kind = (spec or {}).get("type", "")
+            if kind == "currency" and cbr_rates is not None:
+                code, day = cbr_rates.parse_currency_query(text)
+                if not code:
+                    return None
+                if day is None:
+                    return {"currency": code, "date": "", "date_iso": "bad"}
+                return {
+                    "currency": code,
+                    "date": day.strftime("%d.%m.%Y"),
+                    "date_iso": day.isoformat(),
+                }
+            if kind == "coin" and crypto_rates is not None:
+                ticker = crypto_rates.resolve_coin(text)
+                if not ticker:
+                    return None
+                return {"coin": ticker}
+            if kind == "weather":
+                # Убираем короткое имя команды, остаток — запрос погоды.
+                name_norm = self._normalize_text(cmd_name)
+                query = text
+                if name_norm and query.startswith(name_norm):
+                    query = query[len(name_norm):].strip()
+                query = query or text
+                if len(query.split()) < 1:
+                    return None
+                return {"query": query}
+        return None
+
     @staticmethod
     def _fill_slots(value, substitutions):
         """Подставляет слоты в value шага: «.../episode/{number}/» → «.../episode/312/»."""
@@ -2569,7 +2750,10 @@ class FoxAssistantCore:
         self.send_to_gui(self.t("ui_user_name"), full_phrase)  
         command_text = self._normalize_text(command_text)  
           
-        chitchat_reply, chitchat_score = self._match_chitchat(command_text)  
+        chitchat_reply, chitchat_score = self._match_chitchat(command_text)
+        # Короткий «курс» путается с болталкой «курочка» — для курсов это не еда.
+        if re.match(r"^(курс|rate|price)\b", command_text):
+            chitchat_reply, chitchat_score = None, 0.0
           
         # Шаблоны со слотами идут первыми: иначе «включи саус парк серия 312»
         # уедет в команду «включи саус парк» без номера.
@@ -2588,9 +2772,17 @@ class FoxAssistantCore:
                 self.reset_wake_state()  
             return  
           
-        if best_cmd_score >= float(self.config.get("asr_cmd_threshold", 70)) and best_cmd:  
-            self.execute_scenario(self.commands[best_cmd].get("steps", []))  
-            return  
+        if best_cmd_score >= float(self.config.get("asr_cmd_threshold", 70)) and best_cmd:
+            cmd_data = self.commands[best_cmd]
+            # Голое имя «курс валюты» часто побеждает fuzzy, хотя в фразе ещё
+            # есть «доллара». Достаём слот из всего текста перед пустым сценарием.
+            if cmd_data.get("slots"):
+                rescued = self._rescue_slot_values(best_cmd, command_text)
+                if rescued:
+                    self.execute_scenario(cmd_data.get("steps", []), rescued)
+                    return
+            self.execute_scenario(cmd_data.get("steps", []))
+            return
           
         if chitchat_score >= float(self.config.get("asr_chitchat_threshold", 70)) and chitchat_reply:  
             if chitchat_reply == "CAPABILITIES_TRIGGER":  

@@ -41,6 +41,8 @@ CURRENCIES: dict[str, dict] = {
         "en": "US Dollar",
         "aliases": [
             "usd", "доллар", "доллара", "доллару", "долларе", "доллары", "долларов",
+            # Частые оговорки/ошибки Vosk на «доллар».
+            "долар", "долара", "доларов", "далар", "далара",
             "доллар сша", "доллара сша", "американский доллар", "американского доллара",
             "бакс", "бакса", "баксы",
         ],
@@ -548,7 +550,14 @@ def parse_currency_query(text: str) -> tuple[str | None, date | None]:
         code.lower(),
     )
     rest = re.sub(rf"(?<!\w){re.escape(alias)}(?!\w)", " ", leftover, count=1).strip()
-    if rest:
+    # Слова самой команды («курс валюты доллара») — не битая дата.
+    command_noise = {
+        "курс", "валюты", "валюта", "валюту", "валютный", "официальный",
+        "какой", "какая", "какие", "сколько", "стоит", "цб", "по",
+        "rate", "currency", "cbr", "of", "the", "official",
+    }
+    rest_words = [w for w in rest.split() if w not in command_noise]
+    if rest_words:
         return code, None
     return code, date.today()
 
