@@ -51,8 +51,9 @@ echo   run.bat --reinstall   reinstall basic dependencies
 echo   run.bat --full        also install full-mode deps (Whisper/Silero/kokoro)
 echo   run.bat --help        this help
 echo.
-echo   Full-mode packages are normally downloaded from the app when you enable
-echo   Full mode in About. Use --full only for offline/preseed installs.
+echo   Basic setup also downloads the Vosk model into model\.
+echo   Full-mode engines download from the app when you select them.
+echo   Use --full only to preseed Whisper/Silero/kokoro offline.
 exit /b 0
 
 :endparse
@@ -109,19 +110,30 @@ if "%NEED_DEPS%"=="1" (
     echo [2/3] Virtual environment is ready, dependencies are up to date.
 )
 
-REM --- 3b. Full-mode deps (optional) -----------------------------------------
-REM Basic install stops at requirements.txt. Whisper / Silero / kokoro are
-REM downloaded from the app when Full mode is enabled. --full preseeds them.
+REM --- 3b. Vosk speech model (required for basic mode) -----------------------
+REM Weights are gitignored (~45 MB). Without them recognition cannot start.
+echo [2b/3] Checking Vosk model in model\ ...
+"%VENV_PY%" "%~dp0basic_setup.py"
+if errorlevel 1 (
+    echo [ERROR] Vosk model is missing. Download
+    echo         https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip
+    echo         and unpack it into the model\ folder so that model\conf exists.
+    if "%SETUP_ONLY%"=="1" exit /b 1
+)
+
+REM --- 3c. Full-mode deps (optional preseed) ---------------------------------
+REM Whisper / Silero / kokoro normally download from the app when you pick them
+REM after enabling Full mode. --full only preseeds everything offline.
 if "%INSTALL_FULL%"=="1" (
-    echo [2b/3] Installing full-mode dependencies ^(Whisper / Silero / kokoro^)...
-    "%VENV_PY%" "%~dp0full_deps.py"
+    echo [2c/3] Installing full-mode dependencies ^(Whisper / Silero / kokoro^)...
+    "%VENV_PY%" "%~dp0full_deps.py" full
     if errorlevel 1 (
         echo [WARN] Full-mode install finished with errors. Basic mode still works.
     ) else (
         echo        Full-mode dependencies are ready.
     )
 ) else (
-    echo [2b/3] Full-mode deps skipped. Enable Full mode in the app to download them.
+    echo [2c/3] Full-mode deps skipped. Pick engines in Full mode to download them.
 )
 
 if "%SETUP_ONLY%"=="1" (

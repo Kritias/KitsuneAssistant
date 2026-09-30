@@ -307,25 +307,22 @@ def kokoro_available(
 def downloadable_engines(config: dict, directory: str | None = None) -> list[str]:
     """Движки, которые есть смысл догрузить: пакеты стоят, а модели нет.
 
-    Нужна, чтобы приложение подтянуло модели в фоне и при этом не считало это
-    обязательным шагом, роняющим запуск при сбое сети.
-
-    Учитывает железо: в режиме ``auto`` модель Silero тянется только при живой
-    CUDA, иначе на CPU выгоднее лёгкий kokoro — не стоит занимать сотни
-    мегабайт ради заведомо худшего варианта. Явный выбор ``silero`` уважается
-    всегда, даже без CUDA.
+    Качаем только при явном выборе Silero или kokoro. Режим ``auto`` и
+    сетевые движки ничего не тянут — иначе включение полного режима само
+    скачало бы сотни мегабайт.
     """
     requested = str(config.get("tts_engine", "auto")).lower()
-    if requested in ("edge-tts", "pyttsx3"):
-        # Сетевой движок выбран осознанно — локальные модели не нужны.
+    if requested not in ("silero", "kokoro"):
         return []
 
     engines = []
 
-    if _can_import("torch") and not os.path.isfile(silero_model_path(directory)):
-        if requested == "silero" or torch_info()["cuda"]:
+    if requested == "silero":
+        if _can_import("torch") and not os.path.isfile(silero_model_path(directory)):
             engines.append("silero")
+        return engines
 
+    # kokoro
     if all(_can_import(pkg) for pkg, _ in KOKORO_PACKAGES):
         model = os.path.join(
             _kokoro_root(directory),
@@ -341,12 +338,16 @@ def downloadable_engines(config: dict, directory: str | None = None) -> list[str
 def choose_engine(config: dict, directory: str | None = None) -> tuple[str | None, str]:
     """Выбирает локальный движок. Возвращает (имя или None, пояснение).
 
-    Порядок решения: явный выбор пользователя → Silero (нужны torch и CUDA)
-    → kokoro (ONNX, идёт на любом CPU) → ничего, то есть работа через
-    edge-tts и pyttsx3 как раньше.
+    Silero и kokoro поднимаются только при явном выборе. ``auto``,
+    edge-tts и SAPI локальные веса не трогают.
     """
     requested = str(config.get("tts_engine", "auto")).lower()
     quantized = _prefer_quantized(config)
+
+    # auto и сетевые голоса ничего не поднимают: иначе включение полного
+    # режима само затянуло бы Silero/kokoro в ОЗУ, даже если их не выбирали.
+    if requested in ("", "auto", "edge-tts", "pyttsx3"):
+        return None, "сетевой синтез, локальные модели не загружаются"
 
     if requested == "silero":
         ok, reason = silero_available(directory)
@@ -354,24 +355,8 @@ def choose_engine(config: dict, directory: str | None = None) -> tuple[str | Non
     if requested == "kokoro":
         ok, reason = kokoro_available(directory, quantized)
         return ("kokoro", "") if ok else (None, reason)
-    if requested in ("edge-tts", "pyttsx3"):
-        return None, "выбран сетевой движок"
 
-    # auto: Silero раскрывается только на CUDA, на CPU быстрее kokoro.
-    silero_ok, silero_reason = silero_available(directory)
-    use_silero = silero_ok and torch_info()["cuda"]
-
-    kokoro_ok, kokoro_reason = kokoro_available(directory, quantized)
-    if kokoro_ok and not use_silero:
-        return "kokoro", ""
-    if use_silero:
-        return "silero", ""
-
-    # Остался единственный локальный вариант — Silero без CUDA.
-    if silero_ok:
-        return "silero", ""
-
-    return None, kokoro_reason or silero_reason or "локальные движки недоступны"
+    return None, "локальный движок не выбран"
 
 
 # ---------------------------------------------------------------------------

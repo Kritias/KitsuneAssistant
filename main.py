@@ -43,8 +43,12 @@ except Exception:  # модуль опционален: базовому реж�
     tts_local = None
 try:
     import full_deps
-except Exception:  # без модуля полный режим просто не догрузится из UI
+except Exception:  # без модуля движки полного режима не догрузятся из UI
     full_deps = None
+try:
+    import basic_setup
+except Exception:  # без модуля лаунчер всё равно качает Vosk отдельно
+    basic_setup = None
 
 # --- Киберпанк-палитра KITSUNE ---
 HUD_THEME = {
@@ -164,12 +168,111 @@ class FoxAssistantApp(ctk.CTk):
 
         self.setup_ui()
         self.set_window_mode("mini")
+        self._install_clipboard_hotkeys()
         
         self.animate_hud()
+        self.after(100, self._ensure_basic_vosk_model)
         self.after(500, self.auto_start_listening)
 
     def t(self, key, default=""):
         return self.lang.get(key, default if default else key)
+
+    def _install_clipboard_hotkeys(self):
+        """Ctrl+C/V/X/A при русской (и любой не-EN) раскладке.
+
+        Tk биндит только keysym Control-c/v/...; на RU те же физ. клавиши
+        дают Cyrillic_* и буфер обмена молчит. keycode на Windows стабилен.
+        """
+        def _widget_state(widget):
+            try:
+                return str(widget.cget("state"))
+            except Exception:
+                return "normal"
+
+        def _copy_selection(widget):
+            try:
+                selected = widget.selection_get()
+            except Exception:
+                return False
+            try:
+                widget.clipboard_clear()
+                widget.clipboard_append(selected)
+                return True
+            except Exception:
+                return False
+
+        def _handler(event):
+            if not (event.state & 0x4):
+                return
+            widget = event.widget
+            if widget is None:
+                return
+            keycode = event.keycode
+            keysym = (event.keysym or "").lower()
+            state = _widget_state(widget)
+            try:
+                # 67=C, 86=V, 88=X, 65=A (Win VK); не дублируем EN-раскладку
+                if keycode == 67:
+                    if state == "disabled":
+                        _copy_selection(widget)
+                        return "break"
+                    if keysym != "c":
+                        widget.event_generate("<<Copy>>")
+                        return "break"
+                if keycode == 86:
+                    if state == "disabled":
+                        return "break"
+                    if keysym != "v":
+                        widget.event_generate("<<Paste>>")
+                        return "break"
+                if keycode == 88:
+                    if state == "disabled":
+                        return "break"
+                    if keysym != "x":
+                        widget.event_generate("<<Cut>>")
+                        return "break"
+                if keycode == 65 and keysym != "a":
+                    try:
+                        widget.tag_add("sel", "1.0", "end-1c")
+                        widget.mark_set("insert", "1.0")
+                        return "break"
+                    except Exception:
+                        pass
+                    try:
+                        widget.select_range(0, "end")
+                        widget.icursor("end")
+                        return "break"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        self.bind_all("<KeyPress>", _handler, add="+")
+
+    def _make_textbox_selectable(self, textbox):
+        """Выделение и Ctrl+C в read-only CTkTextbox (state=disabled)."""
+        def _focus(_event=None):
+            try:
+                textbox.focus_set()
+            except Exception:
+                pass
+
+        def _copy(_event=None):
+            try:
+                selected = textbox.selection_get()
+                textbox.clipboard_clear()
+                textbox.clipboard_append(selected)
+            except Exception:
+                pass
+            return "break"
+
+        # disabled Text не берёт фокус сам — без этого нет sel/Ctrl+C
+        textbox.bind("<Button-1>", _focus)
+        textbox.bind("<Control-c>", _copy)
+        textbox.bind("<<Copy>>", _copy)
+        # Вставка/вырезание в логе не нужны
+        textbox.bind("<<Paste>>", lambda e: "break")
+        textbox.bind("<<Cut>>", lambda e: "break")
 
     def get_available_input_devices(self):
         """Список устройств ввода: [(индекс, название), ...].
@@ -180,7 +283,7 @@ class FoxAssistantApp(ctk.CTk):
         остальных API у устройств другие индексы и латентности, и выбрать
         их в config можно только случайно. Псевдоустройства (Sound Mapper,
         «первичный драйвер») и служебные записи с мусорными именами
-        («@System32\...») отбрасываются по чёрному списку.
+        («@System32/...») отбрасываются по чёрному списку.
         """
         devices = []
         seen_names = set()
@@ -333,7 +436,10 @@ class FoxAssistantApp(ctk.CTk):
                 print(f"[Avatar Load Error]: {e}")
 
     def auto_start_listening(self):
-        if not self.core.is_listening and self.core.model:
+        ready = self.core.model or (
+            getattr(self.core, "asr_engine", "") == "whisper" and self.core.whisper
+        )
+        if not self.core.is_listening and ready:
             self.toggle_listen()
 
     def load_sleep_icons(self):
@@ -594,10 +700,7 @@ class FoxAssistantApp(ctk.CTk):
                 "text_color": HUD_THEME["text_bright"],
             }
         else:
-            needs_download = full_deps is None or not full_deps.is_ready()
-            mode_btn_text = self.t(
-                "about_enable_full_btn_download" if needs_download else "about_enable_full_btn"
-            )
+            mode_btn_text = self.t("about_enable_full_btn")
             mode_btn_colors = {
                 "fg_color": "#00F0FF",
                 "hover_color": "#00B8C4",
@@ -626,28 +729,16 @@ class FoxAssistantApp(ctk.CTk):
         btn_close.grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
     def toggle_full_mode(self, window=None):
-        """Включает/выключает полный режим и применяет его дефолты.
+        """Включает/выключает полный режим.
 
-        Полный: auto-выбор движков — whisper, Silero/kokoro по железу.
-        Если пакеты ещё не скачаны, сначала догружает их и перезапускает
-        приложение. Базовый: Vosk и edge-tts, тяжёлые модели не качаются.
+        Сам переход пакеты не качает: Whisper/Silero/kokoro догружаются
+        позже, когда их выбирают в настройках. Базовый режим остаётся на
+        Vosk + edge-tts.
         """
-        new_full = not self._full_mode()
-        if new_full:
-            if full_deps is not None and not full_deps.is_ready():
-                if window is not None:
-                    try:
-                        window.destroy()
-                    except Exception:
-                        pass
-                self._start_full_deps_install()
-                return
-            self._apply_mode_switch(True, window)
-            return
-        self._apply_mode_switch(False, window)
+        self._apply_mode_switch(not self._full_mode(), window)
 
     def _apply_mode_switch(self, new_full, window=None):
-        """Переключает режим, когда зависимости уже на месте."""
+        """Переключает режим и обновляет UI/движки."""
         apply_mode_defaults(self.core.config, new_full)
         self.core.save_config()
 
@@ -666,14 +757,70 @@ class FoxAssistantApp(ctk.CTk):
         label = self.t("mode_enabled_full_msg") if new_full else self.t("mode_disabled_full_msg")
         self.update_chat("System", label)
 
-    def _start_full_deps_install(self):
-        """Окно прогресса: качает Whisper/Silero/kokoro и перезапускает приложение."""
+    def _ensure_basic_vosk_model(self):
+        """Если после клона нет весов Vosk — качает их в фоне и поднимает распознавание."""
+        if basic_setup is None:
+            return
+        if basic_setup.vosk_model_ready():
+            return
+        if getattr(self, "_vosk_fetch_busy", False):
+            return
+        self._vosk_fetch_busy = True
+        self.update_chat("System", self.t("vosk_model_downloading"))
+
+        def worker():
+            ok = False
+            try:
+                ok = basic_setup.ensure_vosk_model(
+                    progress=lambda m: self.after(0, lambda msg=m: self.update_chat("System", msg))
+                )
+            except Exception as exc:
+                self.after(0, lambda: self.update_chat("System", f"{self.t('vosk_model_failed')}: {exc}"))
+
+            def finish():
+                self._vosk_fetch_busy = False
+                if ok:
+                    self.core.model = None
+                    # Пересоздаём recognizer: при старте модели не было.
+                    from assistant_core import find_vosk_model_dir
+                    from vosk import Model
+                    path = find_vosk_model_dir("model")
+                    if path:
+                        try:
+                            self.core.model = Model(path)
+                            self.core.rebuild_recognizer()
+                            self.update_chat("System", self.t("vosk_model_ready"))
+                        except Exception as exc:
+                            self.update_chat("System", f"{self.t('vosk_model_failed')}: {exc}")
+                    else:
+                        self.update_chat("System", self.t("vosk_model_failed"))
+                else:
+                    self.update_chat("System", self.t("vosk_model_failed"))
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_component_install(self, components, pending_config=None):
+        """Окно прогресса: качает выбранные движки и один раз перезапускает.
+
+        ``components`` — список пар ``(имя, модель whisper или None)``.
+        Если за один Save выбраны и распознавание, и синтез, ставятся оба,
+        потом один перезапуск.
+        """
+        if isinstance(components, str):
+            components = [(components, None)]
+        components = [(str(name), model) for name, model in components if name]
         if full_deps is None:
             self.update_chat("System", self.t("full_deps_module_missing"))
             return
-        if getattr(self, "_full_deps_busy", False):
+        if getattr(self, "_full_deps_busy", False) or not components:
             return
         self._full_deps_busy = True
+        if pending_config:
+            self.core.config.update(pending_config)
+            self.core.save_config()
+        label = ", ".join(name for name, _model in components)
 
         win = ctk.CTkToplevel(self)
         win.title(self.t("full_deps_window_title"))
@@ -681,7 +828,6 @@ class FoxAssistantApp(ctk.CTk):
         win.configure(fg_color=HUD_THEME["chassis_dark"])
         win.resizable(False, False)
         win.grab_set()
-        self._full_deps_window = win
 
         card = ctk.CTkFrame(
             win, fg_color=HUD_THEME["panel_card"],
@@ -690,20 +836,18 @@ class FoxAssistantApp(ctk.CTk):
         )
         card.pack(fill="both", expand=True, padx=16, pady=16)
 
-        title = ctk.CTkLabel(
+        ctk.CTkLabel(
             card, text=self.t("full_deps_window_title"),
             font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
             text_color="#FFB703",
-        )
-        title.pack(anchor="w", padx=16, pady=(16, 6))
+        ).pack(anchor="w", padx=16, pady=(16, 6))
 
-        hint = ctk.CTkLabel(
+        ctk.CTkLabel(
             card, text=self.t("full_deps_window_hint"),
             font=ctk.CTkFont(family="Consolas", size=11),
             text_color=HUD_THEME["text_dim"],
             justify="left", wraplength=460,
-        )
-        hint.pack(anchor="w", padx=16, pady=(0, 10))
+        ).pack(anchor="w", padx=16, pady=(0, 10))
 
         log = ctk.CTkTextbox(
             card, font=ctk.CTkFont(family="Consolas", size=11),
@@ -712,19 +856,16 @@ class FoxAssistantApp(ctk.CTk):
             border_width=0, corner_radius=8, height=180,
         )
         log.pack(fill="both", expand=True, padx=16, pady=(0, 12))
-        log.insert("end", self.t("full_deps_starting") + "\n")
+        log.insert("end", self.t("full_deps_starting") + f" [{label}]\n")
         log.configure(state="disabled")
-        self._full_deps_log = log
+        self._make_textbox_selectable(log)
 
         def append_line(message):
-            if not hasattr(self, "_full_deps_log"):
-                return
-            box = self._full_deps_log
             try:
-                box.configure(state="normal")
-                box.insert("end", str(message) + "\n")
-                box.see("end")
-                box.configure(state="disabled")
+                log.configure(state="normal")
+                log.insert("end", str(message) + "\n")
+                log.see("end")
+                log.configure(state="disabled")
             except Exception:
                 pass
 
@@ -733,15 +874,21 @@ class FoxAssistantApp(ctk.CTk):
                 self.after(0, lambda m=message: append_line(m))
 
             try:
-                result = full_deps.install_full(progress=progress)
+                result = {"ok": True, "restart_needed": False, "error": ""}
+                for name, whisper_model in components:
+                    one = full_deps.install_component(
+                        name, progress=progress, whisper_model=whisper_model,
+                    )
+                    result["restart_needed"] = result["restart_needed"] or bool(one.get("restart_needed"))
+                    if not one.get("ok"):
+                        result = one
+                        break
             except Exception as exc:
                 result = {"ok": False, "restart_needed": False, "error": str(exc)}
 
             def finish():
                 self._full_deps_busy = False
                 if result.get("ok"):
-                    apply_mode_defaults(self.core.config, True)
-                    self.core.save_config()
                     append_line(self.t("full_deps_restarting"))
                     self.after(800, self._restart_app)
                 else:
@@ -749,14 +896,13 @@ class FoxAssistantApp(ctk.CTk):
                     append_line(err)
                     self.update_chat("System", self.t("full_deps_failed"))
                     try:
-                        btn = ctk.CTkButton(
+                        ctk.CTkButton(
                             card, text=self.t("about_close_btn"),
                             fg_color="#FB8500", hover_color="#D94400",
                             text_color=HUD_THEME["chassis_dark"],
                             font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
                             command=win.destroy,
-                        )
-                        btn.pack(pady=(0, 12))
+                        ).pack(pady=(0, 12))
                     except Exception:
                         pass
 
@@ -1091,6 +1237,7 @@ class FoxAssistantApp(ctk.CTk):
         self.chat_box.pack(fill="both", expand=True, padx=10, pady=10)
         self.chat_box.insert("end", self.t("log_init_1") + self.t("log_init_2") + self.t("log_init_3"))
         self.chat_box.configure(state="disabled")
+        self._make_textbox_selectable(self.chat_box)
 
     def animate_hud(self):
         w = self.canvas_reactor.winfo_width()
@@ -2029,7 +2176,24 @@ class FoxAssistantApp(ctk.CTk):
         chosen_place = self.combo_weather_place.get().strip()
         self.core.config["weather_location"] = chosen_place or "Долгопрудный"
         self.core.config["weatherapi_key"] = self.entry_weather_key.get().strip()
-        
+
+        # Полный режим: недостающие пакеты и веса выбранных движков качаем сейчас.
+        if self._full_mode() and full_deps is not None:
+            pending = dict(self.core.config)
+            jobs = []
+            whisper_model = full_deps.whisper_model_for_engine(
+                selected_engine, self.core.config.get("whisper_model", "")
+            )
+            if full_deps.needs_for_asr_engine(selected_engine, whisper_model=whisper_model):
+                jobs.append(("asr", whisper_model or None))
+            tts_want = str(self.core.config.get("tts_engine", "auto")).lower()
+            if tts_want in ("silero", "kokoro") and full_deps.needs_for_tts_engine(tts_want):
+                jobs.append((tts_want, None))
+            if jobs:
+                self.core.save_config()
+                self._start_component_install(jobs, pending_config=pending)
+                return
+
         self.core.save_config()
         if engine_changed:
             self.core._init_asr_engine()
