@@ -135,9 +135,8 @@ EN_SPOKEN_DIGITS = (
 # ===========================================================================
 # РЕЖИМЫ ПРИЛОЖЕНИЯ: базовый (без тяжёлых моделей) и полный
 # ===========================================================================
-#: Базовый режим: STT — только Vosk, синтез — edge-tts/SAPI. Тяжёлые модели
-#: (whisper на CUDA, Silero, kokoro) не выбираются и не качаются: приложение
-#: остаётся лёгким, как при первом запуске.
+#: Базовый режим: STT — только Vosk, синтез — edge-tts/SAPI. Whisper
+#: (включая medium/small на CPU), Silero и kokoro остаются в полном режиме.
 MODE_BASIC = "basic"
 MODE_FULL = "full"
 #: Значения, которые принимает конфиг и принудительно выставляет каждый режим.
@@ -150,16 +149,23 @@ _FULL_DEFAULTS = {
     "asr_engine": _FULL_ASR_DEFAULT,
     "tts_engine": "auto",
 }
+#: Движок STT → (устройство, модель). None у модели = взять whisper_model из конфига.
+_WHISPER_ENGINE_PRESETS = {
+    "auto": ("cuda", None),
+    "whisper": ("cuda", None),
+    "whisper_cpu": ("cpu", "large-v3-turbo"),
+    "whisper_medium_cpu": ("cpu", "medium"),
+    "whisper_small_cpu": ("cpu", "small"),
+}
 
 
 def apply_mode_defaults(config, full_mode: bool):
     """Приводит поля движков конфига к значениям выбранного режима.
 
     Переключение режима переписывает выбор движков: в базовом это vosk и
-    auto-синтез (локальные модели не участвуют), в полном — авто-выбор,
-    который сам поднимет whisper/Silero/kokoro по железу. Прочие настройки
-    (словарь, пороги, голосовые ключи) не трогаются, чтобы при возврате
-    в полный режим ничего не пришлось выставлять заново.
+    auto-синтез (Whisper не участвует), в полном — авто-выбор, который сам
+    поднимет whisper/Silero/kokoro по железу. Прочие настройки (словарь,
+    пороги, голосовые ключи) не трогаются.
     """
     config["full_mode"] = bool(full_mode)
     defaults = _FULL_DEFAULTS if full_mode else _BASIC_DEFAULTS
@@ -717,21 +723,71 @@ class FoxAssistantCore:
         except Exception:
             pass
 
+    def _asr_engine_fingerprint(self):
+        """Отпечаток выбранного STT: при совпадении модель заново не грузим."""
+        want = str(self.config.get("asr_engine", "auto")).lower().strip()
+        if want in ("whisper_gpu", "gpu"):
+            want = "whisper"
+        if want == "vosk" or not self.config.get("full_mode", False):
+            return ("vosk",)
+        if want not in _WHISPER_ENGINE_PRESETS:
+            return ("vosk",)
+        device, model_name = _WHISPER_ENGINE_PRESETS[want]
+        if not model_name:
+            model_name = self.config.get("whisper_model", "large-v3-turbo")
+        return (
+            want,
+            device,
+            str(model_name),
+            str(self.config.get("whisper_compute_type") or ""),
+            str(self.config.get("language") or "ru"),
+        )
+
+    def _unload_whisper(self):
+        """Снимает текущий Whisper с CPU/GPU, если он был загружен."""
+        old = getattr(self, "whisper", None)
+        self.whisper = None
+        if old is None:
+            return
+        try:
+            old.unload()
+        except Exception as exc:
+            print(f"[ASR] Не удалось выгрузить Whisper: {exc}")
+            if asr_whisper is not None:
+                asr_whisper.release_memory()
+
     def _init_asr_engine(self):
         """Выбирает движок распознавания и при нехватке железа откатывается на Vosk.
 
-        Порядок решения: ручной выбор → наличие faster-whisper → наличие CUDA →
-        минимальный объём VRAM. Любой отказ означает работу на Vosk, как раньше.
+        ``auto`` / ``whisper`` — GPU, ``whisper_cpu`` — turbo на CPU,
+        ``whisper_medium_cpu`` / ``whisper_small_cpu`` — medium/small на CPU.
+        Все варианты Whisper только в полном режиме; базовый всегда на Vosk.
+        При смене варианта прежняя модель сначала выгружается из ОЗУ.
         """
+        fingerprint = self._asr_engine_fingerprint()
+        same = fingerprint == getattr(self, "_asr_engine_fingerprint", None)
+        if same and fingerprint == ("vosk",) and getattr(self, "asr_engine", None) == "vosk":
+            return
+        if (
+            same
+            and getattr(self, "asr_engine", None) == "whisper"
+            and getattr(self, "whisper", None) is not None
+            and not getattr(self.whisper, "load_error", None)
+        ):
+            return
+
+        self._unload_whisper()
         self.asr_engine = "vosk"
-        self.whisper = None
         self.whisper_reason = "Vosk (CPU)"
+        self._asr_engine_fingerprint = ("vosk",)
 
         if asr_whisper is None:
             self._log_asr("Модуль whisper недоступен, работаю на Vosk (CPU)")
             return
 
-        want = str(self.config.get("asr_engine", "auto")).lower()
+        want = str(self.config.get("asr_engine", "auto")).lower().strip()
+        if want in ("whisper_gpu", "gpu"):
+            want = "whisper"
         if want == "vosk":
             self._log_asr("Движок задан вручную: Vosk (CPU)")
             return
@@ -741,29 +797,46 @@ class FoxAssistantCore:
             self._log_asr("Базовый режим: распознавание на Vosk (CPU)")
             return
 
+        if want not in _WHISPER_ENGINE_PRESETS:
+            self._log_asr(f"Неизвестный движок «{want}» — работаю на Vosk (CPU)")
+            return
+
         available, reason = asr_whisper.whisper_available()
         if not available:
             self._log_asr(f"{reason} — работаю на Vosk (CPU)")
             return
 
-        cuda = asr_whisper.cuda_info()
-        if not cuda:
-            self._log_asr("CUDA не найдена — работаю на Vosk (CPU)")
-            return
+        device, model_name = _WHISPER_ENGINE_PRESETS[want]
+        if not model_name:
+            model_name = self.config.get("whisper_model", "large-v3-turbo")
 
-        min_vram = int(self.config.get("whisper_min_vram_mb", 3000))
-        vram = int(cuda.get("vram_mb") or 0)
-        if vram and vram < min_vram:
-            self._log_asr(
-                f"Видеокарта слабая: {cuda.get('name', 'GPU')} {vram} МБ "
-                f"< {min_vram} МБ — работаю на Vosk (CPU)"
+        if device == "cuda":
+            cuda = asr_whisper.cuda_info()
+            if not cuda:
+                self._log_asr("CUDA не найдена — работаю на Vosk (CPU)")
+                return
+
+            min_vram = int(self.config.get("whisper_min_vram_mb", 3000))
+            vram = int(cuda.get("vram_mb") or 0)
+            if vram and vram < min_vram:
+                self._log_asr(
+                    f"Видеокарта слабая: {cuda.get('name', 'GPU')} {vram} МБ "
+                    f"< {min_vram} МБ — работаю на Vosk (CPU)"
+                )
+                return
+            compute = (
+                self.config.get("whisper_compute_type")
+                or asr_whisper.choose_compute_type(cuda)
             )
-            return
+            where = f"{cuda.get('name', 'CUDA')} {vram} МБ"
+        else:
+            preferred = str(self.config.get("whisper_compute_type") or "").strip()
+            compute = asr_whisper.choose_compute_type_cpu(preferred or "int8")
+            where = "CPU"
 
-        compute = self.config.get("whisper_compute_type") or asr_whisper.choose_compute_type(cuda)
         self.whisper = asr_whisper.WhisperStreamRecognizer(
-            model_name=self.config.get("whisper_model", "large-v3-turbo"),
-            device="cuda",
+            model_name=model_name,
+            device=device,
             compute_type=compute,
             language=self.config.get("language", "ru"),
             silence_ms=self.config.get("vad_silence_ms", 1000),
@@ -772,19 +845,21 @@ class FoxAssistantCore:
             on_log=self._log_asr,
         )
         self.asr_engine = "whisper"
-        self.whisper_reason = f"Whisper на {cuda.get('name', 'CUDA')} ({compute})"
+        self._asr_engine_fingerprint = fingerprint
+        self.whisper_reason = f"Whisper «{model_name}» на {where} ({compute})"
         self._log_asr(
-            f"Распознавание на видеокарте: {cuda.get('name', 'CUDA')} "
-            f"{vram} МБ, {compute}, модель {self.whisper.model_name} — гружу в фоне"
+            f"Распознавание Whisper: {where}, {compute}, "
+            f"модель {self.whisper.model_name} — гружу в фоне"
         )
         self.whisper.load_async()
 
     def _fallback_to_vosk(self, why):
         """Аварийный откат на Vosk, если whisper не смог загрузиться."""
         self._log_asr(f"Whisper не запустился ({why}) — переключаюсь на Vosk (CPU)")
+        self._unload_whisper()
         self.asr_engine = "vosk"
-        self.whisper = None
         self.whisper_reason = "Vosk (CPU)"
+        self._asr_engine_fingerprint = ("vosk",)
 
     def _log_tts(self, message):
         """Единая точка логирования выбора и работы движка синтеза."""
@@ -800,23 +875,43 @@ class FoxAssistantCore:
             return ""
         return tts_local.models_dir(self.config.get("tts_models_dir"))
 
+    def _drop_tts_cache(self):
+        """Выгружает все локальные TTS-движки из ОЗУ/VRAM и очищает кэш."""
+        cache = getattr(self, "_tts_engine_cache", None) or {}
+        self._tts_engine_cache = {}
+        self.tts_local_engine = None
+        for name, engine in list(cache.items()):
+            if engine is None:
+                continue
+            try:
+                if tts_local is not None:
+                    tts_local.release_engine(engine)
+                else:
+                    close = getattr(engine, "close", None)
+                    if callable(close):
+                        close()
+            except Exception as exc:
+                print(f"[TTS] Не удалось выгрузить {name}: {exc}")
+        if tts_local is not None:
+            tts_local.release_memory()
+
     def _init_tts_engine(self):
         """Перенастраивает локальный синтез речи в фоне.
 
         Выбор движка требует импорта torch (чтобы понять, жива ли CUDA), а это
         секунды на Windows. Держать из-за этого окно приложения нельзя, поэтому
         сброс состояния делается сразу, а сама проба уходит в отдельный поток:
-        пока он работает, озвучка идёт через edge-tts.
+        пока он работает, озвучка идёт через edge-tts. Прежние Silero/kokoro
+        снимаются с памяти до загрузки новых.
         """
+        self._tts_setup_token = getattr(self, "_tts_setup_token", 0) + 1
+        token = self._tts_setup_token
         self.tts_local_name = ""
-        self.tts_local_engine = None
-        self._tts_engine_cache = {}
+        self._drop_tts_cache()
         self._tts_voice_fingerprint = self._local_voice_fingerprint()
 
         # Токен нужен, чтобы настройки, сохранённые дважды подряд, не гоняли
         # две настройки параллельно: побеждает последняя, ранняя выходит.
-        self._tts_setup_token = getattr(self, "_tts_setup_token", 0) + 1
-        token = self._tts_setup_token
         threading.Thread(target=self._select_tts_engine, args=(token,), daemon=True).start()
 
     def _tts_setup_is_current(self, token):
@@ -907,9 +1002,9 @@ class FoxAssistantCore:
         if name not in self._tts_engine_cache:
             engine = tts_local.create_engine(name, self.config, self.tts_models_dir())
             if token is not None and not self._tts_setup_is_current(token):
-                # Настройки успели смениться, пока модель поднималась. Возвращать
-                # движок нельзя, и класть его в уже очищенный кэш тоже: иначе
-                # старая озвучка воскреснет в новом наборе настроек.
+                # Настройки успели смениться, пока модель поднималась: выгружаем
+                # сироту сразу, чтобы она не висела в ОЗУ до сборщика мусора.
+                tts_local.release_engine(engine)
                 return None
             self._tts_engine_cache[name] = engine
         return self._tts_engine_cache[name]
@@ -1407,14 +1502,14 @@ class FoxAssistantCore:
     def _sync_local_voice(self):
         """Роняет кэш движков, если в настройках сменился голос.
 
-        Полная реинициализация при смене голоса — слишком дорого (перезагрузка
-        модели), а менять голос без пересоздания движок не умеет. Дешевле
-        сравнить «отпечаток» настроек и пересоздать только затронутый движок.
+        Менять голос без пересоздания движок не умеет, поэтому при смене
+        отпечатка старые Silero/kokoro выгружаются из памяти, а новый
+        экземпляр поднимется лениво при следующей реплике.
         """
         if self._local_voice_fingerprint() == getattr(self, "_tts_voice_fingerprint", None):
             return
         self._tts_voice_fingerprint = self._local_voice_fingerprint()
-        self._tts_engine_cache = {}
+        self._drop_tts_cache()
 
     def _speak_edge(self, text, pitch_mod, rate_mod):
         """Озвучка через edge-tts. False — нет сети или пришло прерывание.

@@ -1,11 +1,11 @@
-# Опциональные зависимости для распознавания речи на видеокарте (NVIDIA/CUDA).
+# Опциональные зависимости для Whisper на видеокарте (NVIDIA/CUDA).
 #
-# Ставятся автоматически из run.sh / run.bat, если найден nvidia-smi,
-# либо вручную:  .venv/Scripts/python -m pip install -r requirements-gpu.txt
+# При первом запуске НЕ ставятся. Догружаются вместе с полным режимом
+# (кнопка в «О лисе» / `python full_deps.py`), если найден nvidia-smi.
+# Базовый режим работает на Vosk из requirements.txt.
 #
-# Без них ассистент работает на Vosk (CPU) — см. config.json -> asr_engine.
-# Первый запуск скачает модель whisper (~1.6 ГБ для large-v3-turbo) в кэш
-# HuggingFace: %USERPROFILE%\.cache\huggingface
+# Первый запуск Whisper скачает веса модели в кэш HuggingFace:
+# %USERPROFILE%\.cache\huggingface
 #
 # Версии зафиксированы по проверенному рабочему окружению (.venv).
 

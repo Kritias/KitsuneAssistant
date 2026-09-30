@@ -1,0 +1,7 @@
+# Распознавание Whisper на CPU (полный режим).
+# CUDA-библиотеки для GPU — отдельно в requirements-gpu.txt.
+#
+# Ставится при включении полного режима (full_deps.py), не при первом запуске.
+
+faster-whisper==1.2.1
+ctranslate2==4.8.2

@@ -5,6 +5,7 @@ import time
 import json
 import random
 import threading
+import subprocess
 import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
@@ -40,6 +41,10 @@ try:
     import tts_local
 except Exception:  # модуль опционален: базовому режиму он не нужен
     tts_local = None
+try:
+    import full_deps
+except Exception:  # без модуля полный режим просто не догрузится из UI
+    full_deps = None
 
 # --- Киберпанк-палитра KITSUNE ---
 HUD_THEME = {
@@ -500,7 +505,8 @@ class FoxAssistantApp(ctk.CTk):
         """Доступные движки распознавания для списка настроек.
 
         Базовому режиму whisper не показывается: он там всё равно не
-        поднимется, а «настройка, которая ничего не делает», только путает.
+        поднимется. В полном режиме рядом с авто/Vosk — GPU, turbo CPU,
+        medium CPU и small CPU.
         """
         options = {
             self.t("asr_engine_auto"): "auto",
@@ -508,10 +514,15 @@ class FoxAssistantApp(ctk.CTk):
         }
         if self._full_mode():
             options[self.t("asr_engine_whisper")] = "whisper"
+            options[self.t("asr_engine_whisper_cpu")] = "whisper_cpu"
+            options[self.t("asr_engine_whisper_medium_cpu")] = "whisper_medium_cpu"
+            options[self.t("asr_engine_whisper_small_cpu")] = "whisper_small_cpu"
         return options
 
     def _set_engine_combo(self, engine_value):
-        wanted = str(engine_value).lower()
+        wanted = str(engine_value).lower().strip()
+        if wanted in ("whisper_gpu", "gpu"):
+            wanted = "whisper"
         for label, value in self.asr_engine_values.items():
             if value == wanted:
                 self.combo_asr_engine.set(label)
@@ -583,7 +594,10 @@ class FoxAssistantApp(ctk.CTk):
                 "text_color": HUD_THEME["text_bright"],
             }
         else:
-            mode_btn_text = self.t("about_enable_full_btn")
+            needs_download = full_deps is None or not full_deps.is_ready()
+            mode_btn_text = self.t(
+                "about_enable_full_btn_download" if needs_download else "about_enable_full_btn"
+            )
             mode_btn_colors = {
                 "fg_color": "#00F0FF",
                 "hover_color": "#00B8C4",
@@ -614,17 +628,29 @@ class FoxAssistantApp(ctk.CTk):
     def toggle_full_mode(self, window=None):
         """Включает/выключает полный режим и применяет его дефолты.
 
-        Полный: auto-выбор движков — whisper на CUDA, Silero/kokoro по железу,
-        в настройках появляются выбор движка и голоса. Базовый: Vosk и
-        edge-tts, тяжёлые модели не выбираются и не качаются. Настройки
-        движков переписываются дефолтами режима, остальное сохраняется.
+        Полный: auto-выбор движков — whisper, Silero/kokoro по железу.
+        Если пакеты ещё не скачаны, сначала догружает их и перезапускает
+        приложение. Базовый: Vosk и edge-tts, тяжёлые модели не качаются.
         """
         new_full = not self._full_mode()
+        if new_full:
+            if full_deps is not None and not full_deps.is_ready():
+                if window is not None:
+                    try:
+                        window.destroy()
+                    except Exception:
+                        pass
+                self._start_full_deps_install()
+                return
+            self._apply_mode_switch(True, window)
+            return
+        self._apply_mode_switch(False, window)
+
+    def _apply_mode_switch(self, new_full, window=None):
+        """Переключает режим, когда зависимости уже на месте."""
         apply_mode_defaults(self.core.config, new_full)
         self.core.save_config()
 
-        # Пересобираем движки под новый режим: в базовом это остановит
-        # фоновые загрузки локальных моделей и выключит whisper.
         self.core._init_asr_engine()
         self.core._init_tts_engine()
         self.core.rebuild_recognizer()
@@ -639,6 +665,115 @@ class FoxAssistantApp(ctk.CTk):
                 pass
         label = self.t("mode_enabled_full_msg") if new_full else self.t("mode_disabled_full_msg")
         self.update_chat("System", label)
+
+    def _start_full_deps_install(self):
+        """Окно прогресса: качает Whisper/Silero/kokoro и перезапускает приложение."""
+        if full_deps is None:
+            self.update_chat("System", self.t("full_deps_module_missing"))
+            return
+        if getattr(self, "_full_deps_busy", False):
+            return
+        self._full_deps_busy = True
+
+        win = ctk.CTkToplevel(self)
+        win.title(self.t("full_deps_window_title"))
+        win.geometry("520x360")
+        win.configure(fg_color=HUD_THEME["chassis_dark"])
+        win.resizable(False, False)
+        win.grab_set()
+        self._full_deps_window = win
+
+        card = ctk.CTkFrame(
+            win, fg_color=HUD_THEME["panel_card"],
+            border_color=HUD_THEME["panel_border"], border_width=1.5,
+            corner_radius=12,
+        )
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        title = ctk.CTkLabel(
+            card, text=self.t("full_deps_window_title"),
+            font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+            text_color="#FFB703",
+        )
+        title.pack(anchor="w", padx=16, pady=(16, 6))
+
+        hint = ctk.CTkLabel(
+            card, text=self.t("full_deps_window_hint"),
+            font=ctk.CTkFont(family="Consolas", size=11),
+            text_color=HUD_THEME["text_dim"],
+            justify="left", wraplength=460,
+        )
+        hint.pack(anchor="w", padx=16, pady=(0, 10))
+
+        log = ctk.CTkTextbox(
+            card, font=ctk.CTkFont(family="Consolas", size=11),
+            fg_color=HUD_THEME["panel_inner"],
+            text_color=HUD_THEME["text_bright"],
+            border_width=0, corner_radius=8, height=180,
+        )
+        log.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        log.insert("end", self.t("full_deps_starting") + "\n")
+        log.configure(state="disabled")
+        self._full_deps_log = log
+
+        def append_line(message):
+            if not hasattr(self, "_full_deps_log"):
+                return
+            box = self._full_deps_log
+            try:
+                box.configure(state="normal")
+                box.insert("end", str(message) + "\n")
+                box.see("end")
+                box.configure(state="disabled")
+            except Exception:
+                pass
+
+        def worker():
+            def progress(message):
+                self.after(0, lambda m=message: append_line(m))
+
+            try:
+                result = full_deps.install_full(progress=progress)
+            except Exception as exc:
+                result = {"ok": False, "restart_needed": False, "error": str(exc)}
+
+            def finish():
+                self._full_deps_busy = False
+                if result.get("ok"):
+                    apply_mode_defaults(self.core.config, True)
+                    self.core.save_config()
+                    append_line(self.t("full_deps_restarting"))
+                    self.after(800, self._restart_app)
+                else:
+                    err = result.get("error") or self.t("full_deps_failed")
+                    append_line(err)
+                    self.update_chat("System", self.t("full_deps_failed"))
+                    try:
+                        btn = ctk.CTkButton(
+                            card, text=self.t("about_close_btn"),
+                            fg_color="#FB8500", hover_color="#D94400",
+                            text_color=HUD_THEME["chassis_dark"],
+                            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+                            command=win.destroy,
+                        )
+                        btn.pack(pady=(0, 12))
+                    except Exception:
+                        pass
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _restart_app(self):
+        """Перезапускает процесс, чтобы новые пакеты корректно импортировались."""
+        try:
+            script = os.path.abspath(sys.argv[0] or "main.py")
+            args = [sys.executable, script, *sys.argv[1:]]
+            subprocess.Popen(args, cwd=os.path.dirname(script) or os.getcwd())
+        except Exception as exc:
+            self.update_chat("System", f"{self.t('full_deps_restart_failed')}: {exc}")
+            return
+        self.after(50, self._clean_shutdown)
 
     def _refresh_mode_dependent_ui(self):
         """Обновляет экран настроек под текущий режим без пересоздания окна.
@@ -1876,6 +2011,8 @@ class FoxAssistantApp(ctk.CTk):
         self.core.config["asr_grammar"] = bool(self.check_grammar.get())
         self.core.config["asr_debug"] = bool(self.check_asr_debug.get())
         selected_engine = self.asr_engine_values.get(self.combo_asr_engine.get(), "auto")
+        if selected_engine in ("whisper_gpu", "gpu"):
+            selected_engine = "whisper"
         if not self._full_mode():
             # Базовый режим: whisper недоступен независимо от выбора в списке.
             selected_engine = "vosk"

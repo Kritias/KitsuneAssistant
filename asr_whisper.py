@@ -1,16 +1,17 @@
-"""ASR-бэкенд на faster-whisper (работа через видеокарту).
+"""ASR-бэкенд на faster-whisper (CUDA или CPU).
 
 Vosk распознаёт потоково и отдаёт частичные результаты, а whisper работает
 сегментами. Поэтому здесь своя логика: копим аудио, находим конец фразы по
 тишине (энергетический VAD из `asr_vad`) и распознаём накопленный фрагмент
 целиком.
 
-Модуль самодостаточен: `assistant_core` только выбирает движок и дёргает
-`feed()` на каждом блоке аудио.
+Модуль самодостаточен: `assistant_core` выбирает устройство (GPU/CPU) и
+дёргает `feed()` на каждом блоке аудио.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import sys
@@ -127,6 +128,35 @@ def choose_compute_type(cuda, preferred="int8_float16"):
     return "float32"
 
 
+def choose_compute_type_cpu(preferred="int8"):
+    """Подбирает тип вычислений для Whisper на процессоре.
+
+    На CPU обычно лучший баланс — ``int8``: быстрее float32 и заметно
+    легче по памяти, без заметной потери точности для коротких команд.
+    """
+    supported = []
+    try:
+        import ctranslate2
+        supported = list(ctranslate2.get_supported_compute_types("cpu"))
+    except Exception:
+        pass
+    for candidate in (preferred, "int8", "int8_float32", "float32"):
+        if not supported or candidate in supported:
+            return candidate
+    return "float32"
+
+
+def release_memory():
+    """Просит GC и CUDA-кэш отдать память после выгрузки модели."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class WhisperStreamRecognizer:
     """Потоковое распознавание через whisper с определением конца фразы.
 
@@ -158,32 +188,72 @@ class WhisperStreamRecognizer:
         self.load_error = None
         self.load_seconds = 0.0
         self._lock = threading.Lock()
+        #: Инвалидирует фоновую загрузку при unload / повторном load_async.
+        self._load_token = 0
 
     # ------------------------------------------------------------------ загрузка
 
     def load_async(self):
-        threading.Thread(target=self.load, daemon=True).start()
+        self._load_token += 1
+        token = self._load_token
+        threading.Thread(target=self.load, args=(token,), daemon=True).start()
 
-    def load(self):
+    def load(self, token=None):
         """Грузит модель. Исключения запоминаются в `load_error`."""
+        if token is None:
+            token = self._load_token
         try:
-            prepare_cuda_dlls()
+            if self.device == "cuda":
+                prepare_cuda_dlls()
             from faster_whisper import WhisperModel
 
             started = time.time()
-            self.model = WhisperModel(
+            model = WhisperModel(
                 self.model_name, device=self.device, compute_type=self.compute_type
             )
-            self.load_seconds = time.time() - started
             # Прогреваем граф, чтобы первая реальная фраза не ждала инициализации
-            self.model.transcribe(np.zeros(SAMPLERATE, dtype=np.float32),
-                                  language=self.language, beam_size=1)
-            self._log(f"Whisper «{self.model_name}» загружен за {self.load_seconds:.1f} с "
-                      f"({self.device}/{self.compute_type})")
+            model.transcribe(
+                np.zeros(SAMPLERATE, dtype=np.float32),
+                language=self.language,
+                beam_size=1,
+            )
+            load_seconds = time.time() - started
         except Exception as e:
-            self.load_error = f"{type(e).__name__}: {e}"
+            if token == self._load_token:
+                self.load_error = f"{type(e).__name__}: {e}"
+                self.model = None
+                self._log(f"Загрузка Whisper не удалась: {self.load_error}")
+            return
+
+        if token != self._load_token:
+            # Пока грузили, движок уже сменили — новая модель сразу в утиль.
+            del model
+            release_memory()
+            return
+
+        old = self.model
+        self.model = model
+        self.load_seconds = load_seconds
+        self.load_error = None
+        if old is not None:
+            del old
+            release_memory()
+        self._log(
+            f"Whisper «{self.model_name}» загружен за {self.load_seconds:.1f} с "
+            f"({self.device}/{self.compute_type})"
+        )
+
+    def unload(self):
+        """Снимает модель с устройства и отменяет фоновую загрузку."""
+        self._load_token += 1
+        with self._lock:
+            self.vad.reset()
+            model = self.model
             self.model = None
-            self._log(f"Загрузка Whisper не удалась: {self.load_error}")
+        if model is not None:
+            del model
+        release_memory()
+        self._log(f"Whisper «{self.model_name}» выгружен из памяти")
 
     @property
     def ready(self):

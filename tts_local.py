@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -544,6 +545,23 @@ class SileroEngine:
             )
         return audio.detach().cpu().numpy().astype("float32"), self.sample_rate
 
+    def close(self):
+        """Снимает модель с GPU/CPU, чтобы при смене голоса освободилась ОЗУ."""
+        model = getattr(self, "_model", None)
+        self._model = None
+        if model is not None:
+            try:
+                if hasattr(model, "cpu"):
+                    model.cpu()
+            except Exception:
+                pass
+            del model
+        try:
+            if getattr(self, "_device", "") == "cuda":
+                self._torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Числа словами: фронтенд Silero молча теряет цифры
     # ------------------------------------------------------------------
@@ -782,6 +800,16 @@ class KokoroEngine:
         )[0]
         return np.asarray(audio, dtype="float32").reshape(-1), self.sample_rate
 
+    def close(self):
+        """Закрывает ONNX-сессию и отпускает веса голоса."""
+        sess = getattr(self, "_sess", None)
+        self._sess = None
+        self._g2p = None
+        self._style = None
+        self._vocab = None
+        if sess is not None:
+            del sess
+
 
 def create_engine(engine_name: str, config: dict, directory: str | None = None):
     """Создаёт движок по имени. При любой ошибке возвращает None."""
@@ -798,6 +826,35 @@ def create_engine(engine_name: str, config: dict, directory: str | None = None):
         _log(f"Движок {engine_name} не запустился: {exc}")
         return None
     return None
+
+
+def release_engine(engine) -> None:
+    """Выгружает локальный TTS-движок из ОЗУ/VRAM."""
+    if engine is None:
+        return
+    try:
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
+    except Exception as exc:
+        _log(f"Не удалось выгрузить {getattr(engine, 'name', engine)}: {exc}")
+    finally:
+        try:
+            del engine
+        except Exception:
+            pass
+    release_memory()
+
+
+def release_memory() -> None:
+    """Просит GC и CUDA-кэш отдать память после выгрузки синтеза."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def silero_speakers() -> list[str]:
