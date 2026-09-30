@@ -14,3 +14,4 @@ keyboard==0.13.5
 pystray==0.19.5
 edge-tts==7.2.8
 soundfile==0.14.0
+miniaudio==1.71

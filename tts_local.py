@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -306,25 +307,22 @@ def kokoro_available(
 def downloadable_engines(config: dict, directory: str | None = None) -> list[str]:
     """Движки, которые есть смысл догрузить: пакеты стоят, а модели нет.
 
-    Нужна, чтобы приложение подтянуло модели в фоне и при этом не считало это
-    обязательным шагом, роняющим запуск при сбое сети.
-
-    Учитывает железо: в режиме ``auto`` модель Silero тянется только при живой
-    CUDA, иначе на CPU выгоднее лёгкий kokoro — не стоит занимать сотни
-    мегабайт ради заведомо худшего варианта. Явный выбор ``silero`` уважается
-    всегда, даже без CUDA.
+    Качаем только при явном выборе Silero или kokoro. Режим ``auto`` и
+    сетевые движки ничего не тянут — иначе включение полного режима само
+    скачало бы сотни мегабайт.
     """
     requested = str(config.get("tts_engine", "auto")).lower()
-    if requested in ("edge-tts", "pyttsx3"):
-        # Сетевой движок выбран осознанно — локальные модели не нужны.
+    if requested not in ("silero", "kokoro"):
         return []
 
     engines = []
 
-    if _can_import("torch") and not os.path.isfile(silero_model_path(directory)):
-        if requested == "silero" or torch_info()["cuda"]:
+    if requested == "silero":
+        if _can_import("torch") and not os.path.isfile(silero_model_path(directory)):
             engines.append("silero")
+        return engines
 
+    # kokoro
     if all(_can_import(pkg) for pkg, _ in KOKORO_PACKAGES):
         model = os.path.join(
             _kokoro_root(directory),
@@ -340,12 +338,16 @@ def downloadable_engines(config: dict, directory: str | None = None) -> list[str
 def choose_engine(config: dict, directory: str | None = None) -> tuple[str | None, str]:
     """Выбирает локальный движок. Возвращает (имя или None, пояснение).
 
-    Порядок решения: явный выбор пользователя → Silero (нужны torch и CUDA)
-    → kokoro (ONNX, идёт на любом CPU) → ничего, то есть работа через
-    edge-tts и pyttsx3 как раньше.
+    Silero и kokoro поднимаются только при явном выборе. ``auto``,
+    edge-tts и SAPI локальные веса не трогают.
     """
     requested = str(config.get("tts_engine", "auto")).lower()
     quantized = _prefer_quantized(config)
+
+    # auto и сетевые голоса ничего не поднимают: иначе включение полного
+    # режима само затянуло бы Silero/kokoro в ОЗУ, даже если их не выбирали.
+    if requested in ("", "auto", "edge-tts", "pyttsx3"):
+        return None, "сетевой синтез, локальные модели не загружаются"
 
     if requested == "silero":
         ok, reason = silero_available(directory)
@@ -353,24 +355,8 @@ def choose_engine(config: dict, directory: str | None = None) -> tuple[str | Non
     if requested == "kokoro":
         ok, reason = kokoro_available(directory, quantized)
         return ("kokoro", "") if ok else (None, reason)
-    if requested in ("edge-tts", "pyttsx3"):
-        return None, "выбран сетевой движок"
 
-    # auto: Silero раскрывается только на CUDA, на CPU быстрее kokoro.
-    silero_ok, silero_reason = silero_available(directory)
-    use_silero = silero_ok and torch_info()["cuda"]
-
-    kokoro_ok, kokoro_reason = kokoro_available(directory, quantized)
-    if kokoro_ok and not use_silero:
-        return "kokoro", ""
-    if use_silero:
-        return "silero", ""
-
-    # Остался единственный локальный вариант — Silero без CUDA.
-    if silero_ok:
-        return "silero", ""
-
-    return None, kokoro_reason or silero_reason or "локальные движки недоступны"
+    return None, "локальный движок не выбран"
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +482,13 @@ class SileroEngine:
         r"(доллар\w*|рубл\w*|евро|цент\w*|копе\w*|тысяч\w*|миллион\w*|миллиард\w*)",
         re.IGNORECASE,
     )
+    #: Температура и похожие меры: «11 градусов» → «одиннадцать градусов»,
+    #: а не поразрядное «один один градусов».
+    _RE_MEASURE = re.compile(
+        r"(-?\d{1,12})\s+"
+        r"(градус\w*|percent|процент\w*|°C|°|C\b)",
+        re.IGNORECASE,
+    )
 
     def __init__(self, directory: str | None = None, speaker: str = ""):
         import torch
@@ -536,6 +529,23 @@ class SileroEngine:
                 text=text, speaker=self.speaker, sample_rate=self.sample_rate
             )
         return audio.detach().cpu().numpy().astype("float32"), self.sample_rate
+
+    def close(self):
+        """Снимает модель с GPU/CPU, чтобы при смене голоса освободилась ОЗУ."""
+        model = getattr(self, "_model", None)
+        self._model = None
+        if model is not None:
+            try:
+                if hasattr(model, "cpu"):
+                    model.cpu()
+            except Exception:
+                pass
+            del model
+        try:
+            if getattr(self, "_device", "") == "cuda":
+                self._torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Числа словами: фронтенд Silero молча теряет цифры
@@ -686,14 +696,32 @@ class SileroEngine:
             # восемнадцать долларов», а не по цифрам.
             return cls._int_to_words(int(match.group(1))) + " " + match.group(2)
 
+        def measure_sub(match):
+            number = int(match.group(1))
+            unit = match.group(2)
+            if number < 0:
+                return f"минус {cls._int_to_words(abs(number))} {unit}"
+            return f"{cls._int_to_words(number)} {unit}"
+
         # Порядок важен: сначала дроби (иначе валютный проход съест «94»
-        # из «6,94 доллара» как целое), затем время и денежные суммы,
+        # из «6,94 доллара» как целое), затем время, меры и денежные суммы,
         # в конце — остатки цифр поразрядно.
         text = cls._RE_DEC.sub(frac_sub, text)
         text = cls._RE_TIME.sub(time_sub, text)
+        text = cls._RE_MEASURE.sub(measure_sub, text)
         text = cls._RE_CURRENCY.sub(currency_sub, text)
         text = cls._RE_DIGITS.sub(digits_sub, text)
         return text
+
+
+def int_to_words(value: int, gender: str = "муж") -> str:
+    """Публичная обёртка: целое число русскими словами для других модулей."""
+    return SileroEngine._int_to_words(int(value), gender)
+
+
+def plural_form(number: int, forms: tuple) -> str:
+    """Публичная обёртка русского согласования: (один, два, пять)."""
+    return SileroEngine._plural_form(int(number), forms)
 
 
 class KokoroEngine:
@@ -757,6 +785,16 @@ class KokoroEngine:
         )[0]
         return np.asarray(audio, dtype="float32").reshape(-1), self.sample_rate
 
+    def close(self):
+        """Закрывает ONNX-сессию и отпускает веса голоса."""
+        sess = getattr(self, "_sess", None)
+        self._sess = None
+        self._g2p = None
+        self._style = None
+        self._vocab = None
+        if sess is not None:
+            del sess
+
 
 def create_engine(engine_name: str, config: dict, directory: str | None = None):
     """Создаёт движок по имени. При любой ошибке возвращает None."""
@@ -775,6 +813,35 @@ def create_engine(engine_name: str, config: dict, directory: str | None = None):
     return None
 
 
+def release_engine(engine) -> None:
+    """Выгружает локальный TTS-движок из ОЗУ/VRAM."""
+    if engine is None:
+        return
+    try:
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
+    except Exception as exc:
+        _log(f"Не удалось выгрузить {getattr(engine, 'name', engine)}: {exc}")
+    finally:
+        try:
+            del engine
+        except Exception:
+            pass
+    release_memory()
+
+
+def release_memory() -> None:
+    """Просит GC и CUDA-кэш отдать память после выгрузки синтеза."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def silero_speakers() -> list[str]:
     """Голоса Silero.
 
@@ -787,6 +854,77 @@ def silero_speakers() -> list[str]:
 def kokoro_voices() -> list[str]:
     """Голоса kokoro из карты голосов."""
     return list(KOKORO_VOICES)
+
+
+def split_for_early_playback(text: str, first_limit: int = 140, next_limit: int = 240) -> list[str]:
+    """Делит реплику так, чтобы первую фразу можно было озвучить сразу.
+
+    Silero, kokoro и SAPI синтезируют текст целиком. Пока модель считает
+    длинный ответ, звука нет. Первое предложение (или его начало, если оно
+    очень длинное) уходит в синтез отдельно, остаток пакуется крупнее, чтобы
+    не дёргать модель на каждом коротком «уруру».
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return []
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?…])\s+", text) if part.strip()]
+    pieces: list[str] = []
+    for sentence in sentences:
+        limit = first_limit if not pieces else next_limit
+        pieces.extend(_break_long_phrase(sentence, limit))
+    if len(pieces) <= 1:
+        return pieces or [text]
+
+    packed = [pieces[0]]
+    buf = ""
+    for part in pieces[1:]:
+        if buf and len(buf) + 1 + len(part) > next_limit:
+            packed.append(buf)
+            buf = part
+        else:
+            buf = f"{buf} {part}".strip()
+    if buf:
+        packed.append(buf)
+    return packed
+
+
+def _break_long_phrase(text: str, limit: int) -> list[str]:
+    """Режет фразу длиннее limit по запятым, не разрывая слова."""
+    if len(text) <= limit:
+        return [text]
+    clauses = [part.strip() for part in re.split(r"(?<=[,;:])\s+", text) if part.strip()]
+    if len(clauses) == 1:
+        clauses = text.split()
+        glued = []
+        buf = ""
+        for word in clauses:
+            if buf and len(buf) + 1 + len(word) > limit:
+                glued.append(buf)
+                buf = word
+            else:
+                buf = f"{buf} {word}".strip()
+        if buf:
+            glued.append(buf)
+        return glued or [text]
+
+    packed = []
+    buf = ""
+    for clause in clauses:
+        if len(clause) > limit:
+            if buf:
+                packed.append(buf)
+                buf = ""
+            packed.extend(_break_long_phrase(clause, limit))
+            continue
+        if buf and len(buf) + 1 + len(clause) > limit:
+            packed.append(buf)
+            buf = clause
+        else:
+            buf = f"{buf} {clause}".strip()
+    if buf:
+        packed.append(buf)
+    return packed or [text]
 
 
 def normalize_peak(audio, target: float = 0.9, max_gain: float = 8.0):
