@@ -68,6 +68,9 @@ except Exception as _miniaudio_import_error:  # без него edge-tts ждё�
     print(f"[TTS] Потоковое воспроизведение недоступно: {_miniaudio_import_error}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# config.example.json — общий шаблон в git. config.json — копия пользователя,
+# в репозиторий не попадает (см. .gitignore).
+EXAMPLE_CONFIG_FILE = os.path.join(BASE_DIR, "config.example.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 COMMANDS_DIR = os.path.join(BASE_DIR, "commands")
 MARKER_FILE = os.path.expanduser(r"~\\.sleep_never_marker")  
@@ -1331,20 +1334,56 @@ class FoxAssistantCore:
         except Exception as e:  
             print(f"[Voice Detection Error]: {e}")  
          
-    def load_config(self):  
+    def _read_json_object(self, path):
+        """Читает JSON-объект. None — файла нет или он битый."""
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            print(f"[Config] Не читается {os.path.basename(path)}: {exc}")
+            return None
+        return data if isinstance(data, dict) else None
+
+    def ensure_user_config(self):
+        """Создаёт локальный config.json из шаблона, если его ещё нет.
+
+        Существующий файл не трогаем: там ключ погоды, микрофон и город.
+        """
+        if os.path.isfile(CONFIG_FILE):
+            return
+        template = self._read_json_object(EXAMPLE_CONFIG_FILE)
+        if template is None:
+            template = DEFAULT_CONFIG.copy()
+        tmp = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(template, handle, ensure_ascii=False, indent=4)
+                handle.write("\n")
+            os.replace(tmp, CONFIG_FILE)
+            print("[Config] Создан локальный config.json из config.example.json")
+        except Exception as exc:
+            print(f"[Config] Не удалось создать config.json: {exc}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def load_config(self):
+        """Шаблон из git, поверх него — локальный config.json.
+
+        Новые поля из config.example.json подхватываются сами. Поля, которые
+        пользователь уже переопределил в config.json, остаются его.
+        """
+        self.ensure_user_config()
         defaults = DEFAULT_CONFIG.copy()
-        if os.path.exists(CONFIG_FILE):  
-            try:  
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:  
-                    data = json.load(f)
-            except Exception as e:
-                # Битый конфиг (обрыв записи, чужая правка) не должен ронять
-                # приложение целиком: работаем на умолчаниях и говорим об этом.
-                print(f"[Config] Не читается, использую умолчания: {e}")
-                return defaults
-            if isinstance(data, dict):
-                defaults.update(data)
-            return defaults
+        shared = self._read_json_object(EXAMPLE_CONFIG_FILE)
+        if shared:
+            defaults.update(shared)
+        local = self._read_json_object(CONFIG_FILE)
+        if local:
+            defaults.update(local)
         return defaults  
 
     @staticmethod

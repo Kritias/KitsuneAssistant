@@ -24,6 +24,18 @@ __pycache__/
 .tmp/
 temp/
 
+# Личные настройки (ключ погоды, микрофон, город). Шаблон — config.example.json
+config.json
+config.json.tmp
+config.*.local.json
+
+# Секреты и локальные переопределения
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.json
+
 # Системные файлы маркеров сна
 .sleep_never_marker
 

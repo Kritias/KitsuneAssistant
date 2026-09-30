@@ -44,7 +44,7 @@
     "vad_energy_factor": 2.2,
     "vad_max_utterance_s": 18.0,
     "weather_provider": "weatherapi",
-    "weather_location": "Сити",
+    "weather_location": "Долгопрудный",
     "weatherapi_key": "",
     "asr_grammar_lang": "ru"
 }
