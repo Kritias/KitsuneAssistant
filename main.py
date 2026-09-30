@@ -638,10 +638,12 @@ class FoxAssistantApp(ctk.CTk):
     def open_about_window(self):
         about_win = ctk.CTkToplevel(self)
         about_win.title(self.t("about_window_title"))
-        about_win.geometry("460x610")
+        about_win.geometry("460x560")
         about_win.configure(fg_color=HUD_THEME["chassis_dark"])
         about_win.resizable(False, False)
+        about_win.transient(self)
         about_win.grab_set()
+        about_win.focus_force()
 
         card = ctk.CTkFrame(
             about_win, fg_color=HUD_THEME["panel_card"],
@@ -650,45 +652,17 @@ class FoxAssistantApp(ctk.CTk):
         )
         card.pack(fill="both", expand=True, padx=16, pady=16)
 
-        avatar_lbl = ctk.CTkLabel(card, text="")
-        avatar_lbl.pack(pady=(20, 10))
-        avatar_path = self._resolve_asset_path("avatar_path", "fox_avatar.png")
-        if avatar_path and os.path.exists(avatar_path):
-            try:
-                pil_img = Image.open(avatar_path).convert("RGBA")
-                self.about_avatar_ctk = ctk.CTkImage(
-                    light_image=pil_img, 
-                    dark_image=pil_img, 
-                    size=(185, 185)
-                )
-                avatar_lbl.configure(image=self.about_avatar_ctk)
-            except Exception:
-                avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
-        else:
-            avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
-
+        # Кнопки сразу под заголовком — иначе длинное описание выталкивает
+        # «Включить фулл» за край окна, и кажется, что кнопка «не работает».
         lbl_ver = ctk.CTkLabel(
             card, text=f"🦊 KITSUNE // {self.t('about_header_text')} {APP_VERSION}",
             font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
             text_color="#FFB703"
         )
-        lbl_ver.pack(pady=(0, 15))
+        lbl_ver.pack(pady=(16, 10))
 
-        desc_text = self.t("about_desc_text").format(
-            vosk_ver=VOSK_MODEL_VERSION,
-            whisper_ver=WHISPER_VERSION
-        )
-        lbl_desc = ctk.CTkLabel(
-            card, text=desc_text,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            text_color=HUD_THEME["text_bright"],
-            justify="left", wraplength=390
-        )
-        lbl_desc.pack(padx=20, pady=(0, 20))
-
-        # Кнопка режима: «включить фулл» в базовом, «вернуть базовый» в полном.
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
-        btn_row.pack(fill="x", padx=20, pady=(0, 20))
+        btn_row.pack(fill="x", padx=20, pady=(0, 12))
         btn_row.grid_columnconfigure(0, weight=1)
         btn_row.grid_columnconfigure(1, weight=1)
 
@@ -711,7 +685,7 @@ class FoxAssistantApp(ctk.CTk):
             btn_row,
             text=mode_btn_text,
             font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
-            height=32, corner_radius=6,
+            height=36, corner_radius=6,
             command=lambda: self.toggle_full_mode(about_win),
             **mode_btn_colors
         )
@@ -723,10 +697,46 @@ class FoxAssistantApp(ctk.CTk):
             fg_color="#FB8500", hover_color="#D94400",
             text_color=HUD_THEME["chassis_dark"],
             font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
-            height=32, corner_radius=6,
+            height=36, corner_radius=6,
             command=about_win.destroy
         )
         btn_close.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+        avatar_lbl = ctk.CTkLabel(card, text="")
+        avatar_lbl.pack(pady=(4, 8))
+        avatar_path = self._resolve_asset_path("avatar_path", "fox_avatar.png")
+        if avatar_path and os.path.exists(avatar_path):
+            try:
+                pil_img = Image.open(avatar_path).convert("RGBA")
+                self.about_avatar_ctk = ctk.CTkImage(
+                    light_image=pil_img,
+                    dark_image=pil_img,
+                    size=(140, 140)
+                )
+                avatar_lbl.configure(image=self.about_avatar_ctk)
+            except Exception:
+                avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
+        else:
+            avatar_lbl.configure(text="🦊", font=("Segoe UI Emoji", 48))
+
+        desc_text = self.t("about_desc_text").format(
+            vosk_ver=VOSK_MODEL_VERSION,
+            whisper_ver=WHISPER_VERSION
+        )
+        desc_box = ctk.CTkTextbox(
+            card,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color=HUD_THEME["panel_inner"],
+            text_color=HUD_THEME["text_bright"],
+            border_width=0,
+            corner_radius=8,
+            wrap="word",
+            activate_scrollbars=True,
+        )
+        desc_box.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+        desc_box.insert("1.0", desc_text)
+        desc_box.configure(state="disabled")
+        self._make_textbox_selectable(desc_box)
 
     def toggle_full_mode(self, window=None):
         """Включает/выключает полный режим.
@@ -739,23 +749,45 @@ class FoxAssistantApp(ctk.CTk):
 
     def _apply_mode_switch(self, new_full, window=None):
         """Переключает режим и обновляет UI/движки."""
-        apply_mode_defaults(self.core.config, new_full)
-        self.core.save_config()
+        try:
+            apply_mode_defaults(self.core.config, new_full)
+            self.core.save_config()
 
-        self.core._init_asr_engine()
-        self.core._init_tts_engine()
-        self.core.rebuild_recognizer()
-        self.core.reset_wake_state()
+            # Сначала закрываем модалку и обновляем меню — тяжёлую пересборку
+            # ASR делаем следом, чтобы клик не «замирал» на recognizer.
+            if window is not None:
+                try:
+                    window.grab_release()
+                except Exception:
+                    pass
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
 
-        self.setup_actions_and_voices()
-        self._refresh_mode_dependent_ui()
-        if window is not None:
-            try:
-                window.destroy()
-            except Exception:
-                pass
-        label = self.t("mode_enabled_full_msg") if new_full else self.t("mode_disabled_full_msg")
-        self.update_chat("System", label)
+            self.setup_actions_and_voices()
+            self._refresh_mode_dependent_ui()
+            label = (
+                self.t("mode_enabled_full_msg")
+                if new_full
+                else self.t("mode_disabled_full_msg")
+            )
+            self.update_chat("System", label)
+            self.after(0, self._finish_mode_switch_engines)
+        except Exception as exc:
+            self.update_chat("System", f"Не удалось переключить режим: {exc}")
+            print(f"[Mode] switch failed: {exc}")
+
+    def _finish_mode_switch_engines(self):
+        """Догружает/сбрасывает движки после переключения режима."""
+        try:
+            self.core._init_asr_engine()
+            self.core._init_tts_engine()
+            self.core.rebuild_recognizer()
+            self.core.reset_wake_state()
+        except Exception as exc:
+            self.update_chat("System", f"Режим сменён, но движки не пересобрались: {exc}")
+            print(f"[Mode] engine refresh failed: {exc}")
 
     def _ensure_basic_vosk_model(self):
         """Если после клона нет весов Vosk — качает их в фоне и поднимает распознавание."""
